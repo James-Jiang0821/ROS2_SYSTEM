@@ -1,0 +1,29 @@
+# ROS build artifacts
+build/
+install/
+log/
+devel/
+
+# Colcon / catkin misc
+*.log
+*.bag
+*.bag.active
+*.bag.orig
+*.db3
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# VSCode / misc
+.vscode/
+.DS_Store
+
+# Secrets / creds (important)
+*.pem
+*.key
+*.env
+.env
