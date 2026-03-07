@@ -168,7 +168,7 @@ class MaxM10sI2CNode(Node):
         # Params
         self.declare_parameter("i2c_bus", 1)
         self.declare_parameter("i2c_addr", 0x42)
-        self.declare_parameter("poll_hz", 10.0)          # poll stream
+        self.declare_parameter("poll_hz", 2.0)          # poll stream
         self.declare_parameter("max_read_bytes", 256)    # per I2C transaction
         self.declare_parameter("publish_vel", True)
 
@@ -212,15 +212,19 @@ class MaxM10sI2CNode(Node):
         return (hi << 8) | lo
 
     def _read_stream(self, nbytes: int) -> bytes:
-        # Read nbytes from stream register 0xFF
-        # SMBus block read needs a "command/register" byte; use 0xFF then read length bytes.
         n = min(nbytes, self.max_read)
-        data = self.bus.read_i2c_block_data(self.addr, REG_STREAM, n)
+        data = bytearray()
+
+        for _ in range(n):
+            data.append(self.bus.read_byte_data(self.addr, REG_STREAM))
+
         return bytes(data)
 
     def poll_once(self):
         try:
             avail = self._read_avail()
+            self.get_logger().info(f"GNSS available bytes: {avail}")
+
             if avail == 0:
                 self._publish_diag_if_needed(avail=0)
                 return
@@ -321,9 +325,12 @@ def main():
     node = MaxM10sI2CNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
