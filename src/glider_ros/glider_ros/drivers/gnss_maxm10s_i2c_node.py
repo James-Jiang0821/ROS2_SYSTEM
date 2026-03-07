@@ -205,11 +205,9 @@ class MaxM10sI2CNode(Node):
         super().destroy_node()
 
     def _read_avail(self) -> int:
-        # Read 2 bytes from 0xFD/0xFE (little-endian count)
-        # per u-blox MAX-M10S integration manual: 0xFD/0xFE = available bytes, 0xFF = stream :contentReference[oaicite:1]{index=1}
         lo = self.bus.read_byte_data(self.addr, REG_AVAIL_L)
         hi = self.bus.read_byte_data(self.addr, REG_AVAIL_H)
-        return (hi << 8) | lo
+        return (lo << 8) | hi
 
     def _read_stream(self, nbytes: int) -> bytes:
         n = min(nbytes, self.max_read)
