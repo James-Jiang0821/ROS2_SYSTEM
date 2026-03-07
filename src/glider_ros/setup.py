@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'bno085_imu_node = glider_ros.drivers.bno085_imu_node:main',
+            'gnss_maxm10s_i2c = glider_ros.drivers.gnss_maxm10s_i2c_node:main',
+            'iridium_basic_node = glider_ros.drivers.iridium_basic_node:main',
         ],
     },
 )
