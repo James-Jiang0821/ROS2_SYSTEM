@@ -194,18 +194,22 @@ class MaxM10sI2CNode(Node):
 
     def send_ubx(self, cls_id: int, msg_id: int, payload: bytes = b""):
         length = len(payload)
+
         header = bytes([
             cls_id,
             msg_id,
             length & 0xFF,
             (length >> 8) & 0xFF
         ])
-        ck_a, ck_b = ubx_checksum(header + payload)
-        msg = bytes([UBX_SYNC_1, UBX_SYNC_2]) + header + payload + bytes([ck_a, ck_b])
 
-        for b in msg:
-            self.bus.write_byte(self.addr, b)
-            time.sleep(0.001)
+        ck_a, ck_b = ubx_checksum(header + payload)
+
+        msg = bytes([0xB5, 0x62]) + header + payload + bytes([ck_a, ck_b])
+
+        # Proper I2C block write
+        self.bus.write_i2c_block_data(self.addr, msg[0], list(msg[1:]))
+
+        self.get_logger().info("UBX config message sent")
 
     def configure_ubx(self):
         self.get_logger().info("Configuring GNSS for UBX output")
