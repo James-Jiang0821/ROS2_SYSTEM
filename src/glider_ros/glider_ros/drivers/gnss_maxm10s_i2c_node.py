@@ -233,6 +233,7 @@ class MaxM10sI2CNode(Node):
                 chunk = self._read_stream(remaining)
                 if not chunk:
                     break
+                self.get_logger().info(f"First 16 bytes: {[hex(b) for b in chunk[:16]]}")
                 remaining -= len(chunk)
 
                 # u-blox notes that 0xFF can return 0xFF when no data is pending :contentReference[oaicite:2]{index=2}
