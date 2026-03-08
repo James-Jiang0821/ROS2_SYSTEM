@@ -10,7 +10,7 @@ from sensor_msgs.msg import Imu, MagneticField
 # I2C + BNO085
 import board
 import busio
-from adafruit_bno08x import BNO08X_I2C
+from adafruit_bno08x.i2c import BNO08X_I2C
 from adafruit_bno08x import (
     BNO_REPORT_ACCELEROMETER,
     BNO_REPORT_GYROSCOPE,
