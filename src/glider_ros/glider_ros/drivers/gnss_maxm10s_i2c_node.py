@@ -149,7 +149,7 @@ def parse_nav_pvt(payload: bytes):
 
 class MaxM10sI2CNode(Node):
     def __init__(self):
-        super().__init__("gnss_maxm10s_i2c")
+        super().__init__("gnss_maxm10s_i2c_node")
 
         self.declare_parameter("i2c_bus", 1)
         self.declare_parameter("i2c_addr", 0x42)

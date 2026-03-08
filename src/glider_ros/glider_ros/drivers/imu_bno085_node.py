@@ -19,7 +19,7 @@ from adafruit_bno08x import (
 
 class Bno085ImuNode(Node):
     def __init__(self):
-        super().__init__('bno085_imu_node')
+        super().__init__('imu_bno085_node')
 
         # ---------- Params ----------
         self.declare_parameter('frame_id', 'imu_link')

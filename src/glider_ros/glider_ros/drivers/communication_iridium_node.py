@@ -8,7 +8,7 @@ from std_msgs.msg import String
 
 class IridiumBasicNode(Node):
     def __init__(self):
-        super().__init__("iridium_basic_node")
+        super().__init__("communication_iridium_node")
 
         # Parameters
         self.declare_parameter("port", "/dev/serial0")
