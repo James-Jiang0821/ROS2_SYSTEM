@@ -53,9 +53,11 @@ class Bno085ImuNode(Node):
         #  - accelerometer: m/s^2
         #  - gyro: rad/s
         #  - magnetometer: microtesla (uT) -> convert to Tesla by *1e-6
-        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER)
-        self.bno.enable_feature(BNO_REPORT_GYROSCOPE)
-        self.bno.enable_feature(BNO_REPORT_MAGNETOMETER)
+        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER, 20000)
+        self.bno.enable_feature(BNO_REPORT_GYROSCOPE, 20000)
+        self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, 100000)
+
+        time.sleep(1.0)  # Give sensor time to start up
 
         self.get_logger().info("BNO085 initialised and reports enabled.")
 
@@ -74,7 +76,11 @@ class Bno085ImuNode(Node):
             ax, ay, az = self.bno.acceleration          # m/s^2
             gx, gy, gz = self.bno.gyro                 # rad/s
             mx, my, mz = self.bno.magnetic             # uT
-
+            if self.good % 50 == 0:
+                self.get_logger().info(
+                    f"RAW ax={ax:.3f} ay={ay:.3f} az={az:.3f} "
+                    f"gx={gx:.3f} gy={gy:.3f} gz={gz:.3f}"
+                )
             stamp = self.get_clock().now().to_msg()
 
             imu = Imu()
