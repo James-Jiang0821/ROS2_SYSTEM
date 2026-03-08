@@ -267,7 +267,6 @@ class MaxM10sI2CNode(Node):
     def poll_once(self):
         try:
             avail = self._read_avail()
-            self.get_logger().info(f"GNSS available bytes: {avail}")
 
             if avail == 0:
                 self._publish_diag_if_needed(avail=0)
@@ -280,7 +279,6 @@ class MaxM10sI2CNode(Node):
                     break
 
                 if not self.debug_printed_proto:
-                    self.get_logger().info(f"First 16 bytes: {[hex(b) for b in chunk[:16]]}")
                     self.debug_printed_proto = True
 
                 remaining -= len(chunk)
