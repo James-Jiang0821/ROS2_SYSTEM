@@ -13,7 +13,7 @@ class IridiumBasicNode(Node):
         # Parameters
         self.declare_parameter("port", "/dev/serial0")
         self.declare_parameter("baud", 19200)
-        self.declare_parameter("poll_period", 30.0)
+        self.declare_parameter("poll_period", 90.0)
 
         port = self.get_parameter("port").value
         baud = int(self.get_parameter("baud").value)
@@ -31,7 +31,7 @@ class IridiumBasicNode(Node):
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=2,
+            timeout=10,
             xonxoff=False,
             rtscts=False,
             dsrdtr=False,
