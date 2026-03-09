@@ -1,146 +1,115 @@
 #!/usr/bin/env python3
-import math
 import time
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Imu
 
-from sensor_msgs.msg import Imu, MagneticField
-
-# I2C + BNO085
 import board
 import busio
 from adafruit_bno08x.i2c import BNO08X_I2C
-from adafruit_bno08x import (
-    BNO_REPORT_ACCELEROMETER,
-    BNO_REPORT_GYROSCOPE,
-    BNO_REPORT_MAGNETOMETER,
-)
+from adafruit_bno08x import BNO_REPORT_ACCELEROMETER
+
 
 class Bno085ImuNode(Node):
     def __init__(self):
-        super().__init__('imu_bno085_node')
+        super().__init__("bno085_imu_node")
 
-        # ---------- Params ----------
-        self.declare_parameter('frame_id', 'imu_link')
-        self.declare_parameter('rate_hz', 50.0)
-        self.declare_parameter('publish_mag', True)
+        self.declare_parameter("frame_id", "imu_link")
+        self.declare_parameter("rate_hz", 5.0)
+        self.declare_parameter("lin_acc_cov", 1e-2)
 
-        # Covariances (tune later; placeholders are fine)
-        self.declare_parameter('lin_acc_cov', 1e-2)   # (m/s^2)^2
-        self.declare_parameter('ang_vel_cov', 1e-3)   # (rad/s)^2
-        self.declare_parameter('mag_cov', 1e-10)      # Tesla^2
+        self.frame_id = self.get_parameter("frame_id").value
+        self.rate_hz = float(self.get_parameter("rate_hz").value)
+        self.lin_acc_cov = float(self.get_parameter("lin_acc_cov").value)
 
-        self.frame_id = self.get_parameter('frame_id').value
-        self.rate_hz = float(self.get_parameter('rate_hz').value)
-        self.publish_mag = bool(self.get_parameter('publish_mag').value)
+        self.imu_pub = self.create_publisher(Imu, "/imu/data_raw", 20)
 
-        self.lin_acc_cov = float(self.get_parameter('lin_acc_cov').value)
-        self.ang_vel_cov = float(self.get_parameter('ang_vel_cov').value)
-        self.mag_cov = float(self.get_parameter('mag_cov').value)
+        self.bno = None
+        self.good = 0
+        self.bad = 0
+        self.last_stat_t = time.time()
+        self.last_accel = None
 
-        # ---------- Publishers ----------
-        self.imu_pub = self.create_publisher(Imu, '/imu/data_raw', 20)
-        self.mag_pub = self.create_publisher(MagneticField, '/imu/mag', 20)
+        self._init_sensor()
 
-        # ---------- Init I2C + Sensor ----------
+        period = 1.0 / self.rate_hz if self.rate_hz > 0 else 0.2
+        self.timer = self.create_timer(period, self._tick)
+
+    def _init_sensor(self):
         self.get_logger().info("Initialising I2C and BNO085...")
         i2c = busio.I2C(board.SCL, board.SDA)
         self.bno = BNO08X_I2C(i2c)
 
-        # Enable the reports we want
-        # Note: Units are typically:
-        #  - accelerometer: m/s^2
-        #  - gyro: rad/s
-        #  - magnetometer: microtesla (uT) -> convert to Tesla by *1e-6
-        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER, 20000)
-        self.bno.enable_feature(BNO_REPORT_GYROSCOPE, 20000)
-        self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, 100000)
+        self.get_logger().info("Resetting BNO085...")
+        self.bno.soft_reset()
+        time.sleep(2.0)
 
-        time.sleep(1.0)  # Give sensor time to start up
+        self.get_logger().info("Enabling accelerometer...")
+        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER)
+        time.sleep(1.0)
 
-        self.get_logger().info("BNO085 initialised and reports enabled.")
-
-        # ---------- Timer ----------
-        period = 1.0 / self.rate_hz if self.rate_hz > 0 else 0.02
-        self.timer = self.create_timer(period, self._tick)
-
-        # Stats
-        self.good = 0
-        self.bad = 0
-        self.last_stat_t = time.time()
+        self.get_logger().info("BNO085 ready.")
 
     def _tick(self):
         try:
-            # Read sensor
-            ax, ay, az = self.bno.acceleration          # m/s^2
-            gx, gy, gz = self.bno.gyro                 # rad/s
-            mx, my, mz = self.bno.magnetic             # uT
-            if self.good % 50 == 0:
-                self.get_logger().info(
-                    f"RAW ax={ax:.3f} ay={ay:.3f} az={az:.3f} "
-                    f"gx={gx:.3f} gy={gy:.3f} gz={gz:.3f}"
-                )
-            stamp = self.get_clock().now().to_msg()
+            ax, ay, az = self.bno.acceleration
 
-            imu = Imu()
-            imu.header.stamp = stamp
-            imu.header.frame_id = self.frame_id
+            current = (round(ax, 3), round(ay, 3), round(az, 3))
+            if self.last_accel is not None and current == self.last_accel:
+                # only warn occasionally to avoid spam
+                if self.good % 20 == 0:
+                    self.get_logger().warn(f"Accel unchanged: {current}")
+            self.last_accel = current
 
-            # Orientation not provided here (you can later use rotation vector if desired)
-            imu.orientation_covariance[0] = -1.0
+            msg = Imu()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self.frame_id
 
-            imu.linear_acceleration.x = float(ax)
-            imu.linear_acceleration.y = float(ay)
-            imu.linear_acceleration.z = float(az)
+            # orientation unavailable for now
+            msg.orientation_covariance[0] = -1.0
 
-            imu.angular_velocity.x = float(gx)
-            imu.angular_velocity.y = float(gy)
-            imu.angular_velocity.z = float(gz)
+            msg.linear_acceleration.x = float(ax)
+            msg.linear_acceleration.y = float(ay)
+            msg.linear_acceleration.z = float(az)
 
-            # Covariances (diagonal)
+            # gyro disabled for now
+            msg.angular_velocity.x = 0.0
+            msg.angular_velocity.y = 0.0
+            msg.angular_velocity.z = 0.0
+
             for i in range(9):
-                imu.linear_acceleration_covariance[i] = 0.0
-                imu.angular_velocity_covariance[i] = 0.0
-            imu.linear_acceleration_covariance[0] = self.lin_acc_cov
-            imu.linear_acceleration_covariance[4] = self.lin_acc_cov
-            imu.linear_acceleration_covariance[8] = self.lin_acc_cov
-            imu.angular_velocity_covariance[0] = self.ang_vel_cov
-            imu.angular_velocity_covariance[4] = self.ang_vel_cov
-            imu.angular_velocity_covariance[8] = self.ang_vel_cov
+                msg.linear_acceleration_covariance[i] = 0.0
+                msg.angular_velocity_covariance[i] = 0.0
 
-            self.imu_pub.publish(imu)
+            msg.linear_acceleration_covariance[0] = self.lin_acc_cov
+            msg.linear_acceleration_covariance[4] = self.lin_acc_cov
+            msg.linear_acceleration_covariance[8] = self.lin_acc_cov
 
-            if self.publish_mag:
-                mag = MagneticField()
-                mag.header.stamp = stamp
-                mag.header.frame_id = self.frame_id
-
-                # Convert uT -> Tesla
-                mag.magnetic_field.x = float(mx) * 1e-6
-                mag.magnetic_field.y = float(my) * 1e-6
-                mag.magnetic_field.z = float(mz) * 1e-6
-
-                for i in range(9):
-                    mag.magnetic_field_covariance[i] = 0.0
-                mag.magnetic_field_covariance[0] = self.mag_cov
-                mag.magnetic_field_covariance[4] = self.mag_cov
-                mag.magnetic_field_covariance[8] = self.mag_cov
-
-                self.mag_pub.publish(mag)
-
+            self.imu_pub.publish(msg)
             self.good += 1
+
+            if self.good % 10 == 0:
+                self.get_logger().info(
+                    f"RAW ax={ax:.3f} ay={ay:.3f} az={az:.3f}"
+                )
 
             t = time.time()
             if t - self.last_stat_t > 2.0:
-                self.get_logger().info(f"Published IMU: good={self.good} bad={self.bad}")
+                self.get_logger().info(f"IMU stats: good={self.good} bad={self.bad}")
                 self.last_stat_t = t
 
         except Exception as e:
             self.bad += 1
-            # Don’t spam every tick; warn occasionally
-            if self.bad % 50 == 0:
-                self.get_logger().warn(f"IMU read/publish error (count={self.bad}): {e}")
+            self.get_logger().warn(f"IMU read error (count={self.bad}): {e}")
+
+            try:
+                self.get_logger().warn("Reinitialising BNO085...")
+                self._init_sensor()
+            except Exception as reinit_error:
+                self.get_logger().error(f"Reinit failed: {reinit_error}")
+                time.sleep(1.0)
+
 
 def main():
     rclpy.init()
@@ -152,5 +121,6 @@ def main():
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
