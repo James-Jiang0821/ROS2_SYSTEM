@@ -29,7 +29,8 @@ setup(
             'communication_iridium_node = glider_ros.drivers.communication_iridium_node:main',
             'sonar_ping_node = glider_ros.drivers.sonar_ping_node:main',
             'pressure_keller_node = glider_ros.drivers.pressure_keller_node:main',
-            'fake_safety_node = glider_ros.safety.fake_safety_node:main'
+            'fake_safety_node = glider_ros.safety.fake_safety_node:main',
+            'telemetry_manager = glider_ros.manager.telemetry_manager:main'
         ],
     },
 )
