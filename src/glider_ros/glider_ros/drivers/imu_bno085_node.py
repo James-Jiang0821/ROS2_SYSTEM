@@ -169,7 +169,6 @@ class Bno085ImuNode(Node):
                 self.get_logger().error(f"Reinit failed: {reinit_error}")
                 time.sleep(1.0)
 
-
 def main():
     rclpy.init()
     node = Bno085ImuNode()
