@@ -29,6 +29,7 @@ setup(
             'communication_iridium_node = glider_ros.drivers.communication_iridium_node:main',
             'sonar_ping_node = glider_ros.drivers.sonar_ping_node:main',
             'pressure_keller_node = glider_ros.pressure_keller_node:main',
+            'can_bridge_node = glider_ros.manager.can_bridge_node:main',
         ],
     },
 )
