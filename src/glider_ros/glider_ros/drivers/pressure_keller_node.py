@@ -70,24 +70,26 @@ class KellerLD:
     def _read_block(self, length: int) -> list[int]:
         return self.bus.read_i2c_block_data(self.address, 0x00, length)
 
-    def read_memory_map(self, mtp_address: int) -> int:
-        """
-        Matches Arduino pattern:
-        beginTransmission(addr)
-        write(mtp_address)
-        endTransmission()
-        delay(1)
-        requestFrom(addr, 3)
-        status = read()
-        value  = read()<<8 | read()
-        """
-        self._write_byte(mtp_address)
+    from smbus2 import i2c_msg
+
+    def read_memory_map(self, mtp_address):
+
+        # Write the memory address
+        write = i2c_msg.write(self.address, [mtp_address])
+        self.bus.i2c_rdwr(write)
+
         time.sleep(0.001)
-        data = self._read_block(3)
-        if len(data) != 3:
-            raise RuntimeError("Failed to read memory map block")
-        _status = data[0]
-        return (data[1] << 8) | data[2]
+
+        # Read 3 bytes
+        read = i2c_msg.read(self.address, 3)
+        self.bus.i2c_rdwr(read)
+
+        data = list(read)
+
+        status = data[0]
+        value = (data[1] << 8) | data[2]
+
+        return value
 
     @staticmethod
     def _u32_to_float_be(value: int) -> float:
