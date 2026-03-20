@@ -25,8 +25,9 @@ PR    = 3
 # Position scaling
 # Teensy packs est_position as (pos_mm * 100) — hundredths of mm, uint16 LE.
 # e.g. 150 mm -> raw value 15000. Divide by 100 to recover mm.
+VBD_STROKE_MIN_MM = 10.0
 VBD_RAW_PER_MM  = 100.0     # Teensy multiplies mm by this before packing
-VBD_STROKE_MAX_MM = 150.0   # full VBD stroke in mm (0-1 normalisation)
+VBD_STROKE_MAX_MM = 145.0   # full VBD stroke in mm (0-1 normalisation)
 PR_STROKE_MAX_MM  = 110.0   # full P&R stroke in mm
 
 # All 19 faults from Notion spec
@@ -191,11 +192,11 @@ class CanBridgeNode(Node):
         current = struct.unpack_from('<b', data, 7)[0]  # signed int8
 
         if node_id == VBD_L:
-            self.vbd_left_pos = pos_mm / VBD_STROKE_MAX_MM
+            self.vbd_left_pos = (pos_mm-VBD_STROKE_MIN_MM) / (VBD_STROKE_MAX_MM-VBD_STROKE_MIN_MM)
             self.leak_left    = leak
             self.tof_left_mm  = float(tof_mm)
         elif node_id == VBD_R:
-            self.vbd_right_pos = pos_mm / VBD_STROKE_MAX_MM
+            self.vbd_right_pos = (pos_mm-VBD_STROKE_MIN_MM) / (VBD_STROKE_MAX_MM-VBD_STROKE_MIN_MM)
             self.leak_right    = leak
             self.tof_right_mm  = float(tof_mm)
         elif node_id == PR:
