@@ -16,4 +16,10 @@ def generate_launch_description():
             name='fake_safety_node',
             output='screen'
         ),
+        Node(
+            package='glider_ros',
+            executable='gnss_maxm10s_i2c_node',
+            name='gnss_maxm10s_i2c_node',
+            output='screen'
+        ),
     ])
