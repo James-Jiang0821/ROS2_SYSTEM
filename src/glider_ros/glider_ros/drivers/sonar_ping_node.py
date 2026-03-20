@@ -14,7 +14,7 @@ class PingSonarNode(Node):
         super().__init__("sonar_ping1d_node")
 
         # Parameters
-        self.declare_parameter("port", "/dev/ttyAMA0")
+        self.declare_parameter("port", "/dev/ttyAMA5")
         self.declare_parameter("baud", 115200)
         self.declare_parameter("poll_period", 0.2)
         self.declare_parameter("frame_id", "sonar_link")
