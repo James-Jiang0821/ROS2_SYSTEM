@@ -24,8 +24,8 @@ def generate_launch_description():
         ),
         Node(
             package='glider_ros',
-            executable='telemetry_manager_node',
-            name='telemetry_manager_node',
+            executable='telemetry_manager',
+            name='telemetry_manager',
             output='screen'
         ),
     ])
