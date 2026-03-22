@@ -33,7 +33,7 @@ class IridiumBasicNode(Node):
             10
         )
 
-        # Cache latest telemetry payload
+        # Cache latest valid telemetry payload
         self.latest_sbdwt_message = None
 
         # Serial connection
@@ -54,18 +54,24 @@ class IridiumBasicNode(Node):
         # Timer
         self.timer = self.create_timer(poll_period, self.poll_modem)
 
-
     def sbdwt_callback(self, msg: String):
-        """Store latest telemetry message"""
-        self.latest_sbdwt_message = msg.data
-        self.get_logger().info(f"Received new SBDWT payload: {msg.data}")
+        """Store latest valid telemetry message only"""
+        payload = msg.data.strip()
 
+        if not payload:
+            self.get_logger().warn("Received empty /iridium/sbdwt message, ignoring")
+            return
+
+        if len(payload) > 200:
+            payload = payload[:200]
+
+        self.latest_sbdwt_message = payload
+        self.get_logger().info(f"Updated SBDWT payload: {payload}")
 
     def publish_string(self, publisher, text: str):
         msg = String()
         msg.data = text
         publisher.publish(msg)
-
 
     def send_at(self, cmd: str, read_bytes: int = 512) -> str:
         """
@@ -78,13 +84,11 @@ class IridiumBasicNode(Node):
         response = self.ser.read(read_bytes).decode(errors="ignore")
         return response
 
-
     def extract_csq(self, response: str):
         match = re.search(r"\+CSQ:\s*(\d+)", response)
         if match:
             return int(match.group(1))
         return None
-
 
     def mt_message_present(self, response: str) -> bool:
         """
@@ -107,7 +111,6 @@ class IridiumBasicNode(Node):
 
         return False
 
-
     def clean_mt_response(self, response: str) -> str:
         """
         Remove echoed command and trailing OK.
@@ -125,11 +128,8 @@ class IridiumBasicNode(Node):
 
         return "\n".join(lines).strip()
 
-
     def poll_modem(self):
-
         try:
-
             # 1) Check modem alive
             at_resp = self.send_at("AT")
             self.get_logger().info(f"AT response: {repr(at_resp)}")
@@ -154,62 +154,46 @@ class IridiumBasicNode(Node):
 
             # 4) Check for incoming MT message
             if self.mt_message_present(sbdix_resp):
-
                 sbrt_resp = self.send_at("AT+SBDRT", read_bytes=1024)
                 self.get_logger().info(f"SBDRT response: {repr(sbrt_resp)}")
 
                 mt_text = self.clean_mt_response(sbrt_resp)
 
                 if mt_text:
-
                     self.publish_string(self.mt_pub, mt_text)
                     self.publish_string(self.status_pub, f"Received MT: {mt_text}")
                     self.get_logger().info(f"Received MT message: {mt_text}")
 
-                    # 5) Send telemetry reply
-                    if self.latest_sbdwt_message is not None:
+                    # 5) Send telemetry reply only if valid cached telemetry exists
+                    if self.latest_sbdwt_message:
+                        payload = self.latest_sbdwt_message
 
-                        payload = self.latest_sbdwt_message.strip()
+                        self.get_logger().info(f"Yo its me the glider: {payload}")
 
-                        # Limit payload length for safety
-                        if len(payload) > 200:
-                            payload = payload[:200]
+                        cmd = f"AT+SBDWT={payload}"
+                        sbdwt_resp = self.send_at(cmd)
+                        self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
 
+                        self.publish_string(self.status_pub, f"Glider speaking: {payload}")
+
+                        # Send message
+                        reply_resp = self.send_at("AT+SBDIX", read_bytes=1024)
+                        self.get_logger().info(f"Reply SBDIX response: {repr(reply_resp)}")
                     else:
-
-                        payload = "NO_DATA"
-                        self.get_logger().warn("No telemetry available for SBDWT")
-
-                    cmd = f"AT+SBDWT={payload}"
-
-                    self.get_logger().info(f"Sending telemetry via SBDWT: {payload}")
-
-                    sbdwt_resp = self.send_at(cmd)
-                    self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
-
-                    self.publish_string(self.status_pub, f"Sent MO telemetry: {payload}")
-
-                    # Send message
-                    reply_resp = self.send_at("AT+SBDIX", read_bytes=1024)
-                    self.get_logger().info(f"Reply SBDIX response: {repr(reply_resp)}")
+                        self.get_logger().warn("No valid cached /iridium/sbdwt payload, skipping MO reply")
+                        self.publish_string(self.status_pub, "No valid telemetry for MO reply")
 
                 else:
-
                     self.publish_string(self.status_pub, "MT indicated but message empty")
-
             else:
-
                 self.publish_string(self.status_pub, "No MT message waiting")
 
         except Exception as e:
-
             error_text = f"Iridium node error: {str(e)}"
             self.get_logger().error(error_text)
             self.publish_string(self.status_pub, error_text)
 
-
     def destroy_node(self):
-
         try:
             if self.ser and self.ser.is_open:
                 self.ser.close()
@@ -220,11 +204,8 @@ class IridiumBasicNode(Node):
 
 
 def main(args=None):
-
     rclpy.init(args=args)
-
     node = IridiumBasicNode()
-
     try:
         rclpy.spin(node)
     finally:
