@@ -24,6 +24,17 @@ class IridiumBasicNode(Node):
         self.csq_pub = self.create_publisher(String, "/iridium/signal_strength", 10)
         self.mt_pub = self.create_publisher(String, "/iridium/incoming_message", 10)
 
+        # Subscriber for outgoing SBDWT message
+        self.sbdwt_sub = self.create_subscription(
+            String,
+            "/iridium/sbdwt",
+            self.sbdwt_callback,
+            10
+        )
+
+        # Store latest outgoing message
+        self.latest_sbdwt_message = "got it"
+
         # Serial connection
         self.ser = serial.Serial(
             port=port,
@@ -41,6 +52,9 @@ class IridiumBasicNode(Node):
 
         # Timer
         self.timer = self.create_timer(poll_period, self.poll_modem)
+
+    def sbdwt_callback(self, msg: String):
+        self.latest_sbdwt_message = msg.data
 
     def publish_string(self, publisher, text: str):
         msg = String()
@@ -140,13 +154,13 @@ class IridiumBasicNode(Node):
                     self.publish_string(self.status_pub, f"Received MT: {mt_text}")
                     self.get_logger().info(f"Received MT message: {mt_text}")
 
-                    # 5) Send a simple MO reply
-                    sbdwt_resp = self.send_at("AT+SBDWT=got it")
+                    # 5) Send MO reply using latest /iridium/sbdwt message
+                    sbdwt_resp = self.send_at(f"AT+SBDWT={self.latest_sbdwt_message}")
                     self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
 
                     reply_resp = self.send_at("AT+SBDIX", read_bytes=1024)
                     self.get_logger().info(f"Reply SBDIX response: {repr(reply_resp)}")
-                    self.publish_string(self.status_pub, "Sent MO reply: got it")
+                    self.publish_string(self.status_pub, f"Sent MO reply: {self.latest_sbdwt_message}")
                 else:
                     self.publish_string(self.status_pub, "MT indicated, but message was empty")
             else:
