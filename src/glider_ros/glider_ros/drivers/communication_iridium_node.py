@@ -43,7 +43,7 @@ class IridiumBasicNode(Node):
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=10,
+            timeout=3,
             xonxoff=False,
             rtscts=False,
             dsrdtr=False,
@@ -55,13 +55,16 @@ class IridiumBasicNode(Node):
         self.timer = self.create_timer(poll_period, self.poll_modem)
 
     def sbdwt_callback(self, msg: String):
-        """Store latest valid telemetry message only"""
+        """Store latest valid telemetry message only."""
+        self.get_logger().info(f"/iridium/sbdwt raw received: {repr(msg.data)}")
+
         payload = msg.data.strip()
 
         if not payload:
             self.get_logger().warn("Received empty /iridium/sbdwt message, ignoring")
             return
 
+        # Trim for safety
         if len(payload) > 200:
             payload = payload[:200]
 
@@ -84,6 +87,10 @@ class IridiumBasicNode(Node):
         response = self.ser.read(read_bytes).decode(errors="ignore")
         return response
 
+    def command_ok(self, response: str) -> bool:
+        """Basic check for OK response."""
+        return ("OK" in response) and ("ERROR" not in response)
+
     def extract_csq(self, response: str):
         match = re.search(r"\+CSQ:\s*(\d+)", response)
         if match:
@@ -93,7 +100,7 @@ class IridiumBasicNode(Node):
     def mt_message_present(self, response: str) -> bool:
         """
         Parse +SBDIX line.
-        Format:
+        Expected format:
         +SBDIX: mo_status, momsn, mt_status, mtmsn, mt_len, mt_queued
         """
         match = re.search(r"\+SBDIX:\s*([0-9,\s-]+)", response)
@@ -106,8 +113,8 @@ class IridiumBasicNode(Node):
                 mt_len = nums[4]
                 mt_queued = nums[5]
                 return (mt_len > 0) or (mt_queued > 0)
-        except Exception:
-            pass
+        except Exception as e:
+            self.get_logger().warn(f"Failed to parse SBDIX response: {e}")
 
         return False
 
@@ -164,25 +171,33 @@ class IridiumBasicNode(Node):
                     self.publish_string(self.status_pub, f"Received MT: {mt_text}")
                     self.get_logger().info(f"Received MT message: {mt_text}")
 
-                    # 5) Send telemetry reply only if valid cached telemetry exists
-                    if self.latest_sbdwt_message:
-                        payload = self.latest_sbdwt_message
+                    # 5) Only send MO if we have a valid cached telemetry string
+                    if self.latest_sbdwt_message is not None:
+                        payload = self.latest_sbdwt_message.strip()
 
-                        self.get_logger().info(f"Yo its me the glider: {payload}")
+                        if payload:
+                            self.get_logger().info(f"Sending telemetry via SBDWT: {payload}")
 
-                        cmd = f"AT+SBDWT={payload}"
-                        sbdwt_resp = self.send_at(cmd)
-                        self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
+                            cmd = f"AT+SBDWT={payload}"
+                            sbdwt_resp = self.send_at(cmd, read_bytes=1024)
+                            self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
 
-                        self.publish_string(self.status_pub, f"Glider speaking: {payload}")
+                            if self.command_ok(sbdwt_resp):
+                                self.publish_string(self.status_pub, f"Loaded MO telemetry: {payload}")
 
-                        # Send message
-                        reply_resp = self.send_at("AT+SBDIX", read_bytes=1024)
-                        self.get_logger().info(f"Reply SBDIX response: {repr(reply_resp)}")
+                                # Only now run second SBDIX to actually send MO
+                                reply_resp = self.send_at("AT+SBDIX", read_bytes=1024)
+                                self.get_logger().info(f"Reply SBDIX response: {repr(reply_resp)}")
+                                self.publish_string(self.status_pub, "Sent MO telemetry")
+                            else:
+                                self.get_logger().error("SBDWT failed, skipping MO send")
+                                self.publish_string(self.status_pub, "SBDWT failed, skipped MO send")
+                        else:
+                            self.get_logger().warn("Cached telemetry empty after strip, skipping MO reply")
+                            self.publish_string(self.status_pub, "Skipping MO reply: empty cached telemetry")
                     else:
-                        self.get_logger().warn("No valid cached /iridium/sbdwt payload, skipping MO reply")
-                        self.publish_string(self.status_pub, "No valid telemetry for MO reply")
-
+                        self.get_logger().warn("No cached /iridium/sbdwt payload, skipping MO reply")
+                        self.publish_string(self.status_pub, "Skipping MO reply: no cached telemetry")
                 else:
                     self.publish_string(self.status_pub, "MT indicated but message empty")
             else:
