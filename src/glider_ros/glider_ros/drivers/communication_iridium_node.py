@@ -178,7 +178,7 @@ class IridiumBasicNode(Node):
                         if payload:
                             self.get_logger().info(f"Sending telemetry via SBDWT: {payload}")
 
-                            cmd = f"AT+SBDWT={payload}"
+                            cmd = f'AT+SBDWT="{payload}"'
                             sbdwt_resp = self.send_at(cmd, read_bytes=1024)
                             self.get_logger().info(f"SBDWT response: {repr(sbdwt_resp)}")
 
