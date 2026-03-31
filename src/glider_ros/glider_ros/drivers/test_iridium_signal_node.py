@@ -14,7 +14,7 @@ class IridiumCsqNode(Node):
         # Parameters
         self.declare_parameter("port", "/dev/ttyAMA5")
         self.declare_parameter("baud", 19200)
-        self.declare_parameter("base_period", 60.0)   # seconds
+        self.declare_parameter("base_period", 20.0)   # seconds
         self.declare_parameter("jitter", 10.0)        # +/- seconds
 
         self.port = self.get_parameter("port").value
