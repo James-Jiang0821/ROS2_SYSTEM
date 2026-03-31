@@ -25,6 +25,7 @@ class IridiumCsqNode(Node):
         # Publishers
         self.csq_pub = self.create_publisher(String, "/iridium/signal_strength", 10)
         self.status_pub = self.create_publisher(String, "/iridium/status", 10)
+        self.mt_pub = self.create_publisher(String, "/iridium/incoming_message", 10)
 
         # Serial connection
         try:
@@ -47,7 +48,7 @@ class IridiumCsqNode(Node):
             self.get_logger().error(err)
             self.publish_string(self.status_pub, err)
 
-        # One-shot timer pattern so each interval can have fresh jitter
+        # One-shot timer
         self.timer = None
         self.schedule_next_poll(initial_delay=2.0)
 
@@ -56,7 +57,7 @@ class IridiumCsqNode(Node):
         msg.data = text
         publisher.publish(msg)
 
-    def send_at(self, cmd: str, read_bytes: int = 256) -> str:
+    def send_at(self, cmd: str, read_bytes: int = 512) -> str:
         if self.ser is None or not self.ser.is_open:
             raise RuntimeError("Serial port is not open")
 
@@ -73,6 +74,42 @@ class IridiumCsqNode(Node):
             return int(match.group(1))
         return None
 
+    def mt_message_present(self, response: str) -> bool:
+        """
+        Parse:
+        +SBDIX: mo_status, momsn, mt_status, mtmsn, mt_len, mt_queued
+        """
+        match = re.search(r"\+SBDIX:\s*([0-9,\s-]+)", response)
+        if not match:
+            return False
+
+        try:
+            nums = [int(x.strip()) for x in match.group(1).split(",")]
+            if len(nums) >= 6:
+                mt_len = nums[4]
+                mt_queued = nums[5]
+                return (mt_len > 0) or (mt_queued > 0)
+        except Exception:
+            pass
+
+        return False
+
+    def clean_mt_response(self, response: str) -> str:
+        """
+        Remove echoed command and trailing OK from AT+SBDRT response.
+        """
+        lines = []
+        for line in response.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line == "AT+SBDRT":
+                continue
+            if line == "OK":
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
     def schedule_next_poll(self, initial_delay=None):
         if self.timer is not None:
             self.timer.cancel()
@@ -81,27 +118,25 @@ class IridiumCsqNode(Node):
             delay = initial_delay
         else:
             delay = self.base_period + random.uniform(-self.jitter, self.jitter)
-            delay = max(1.0, delay)  # avoid zero/negative times
+            delay = max(1.0, delay)
 
-        self.get_logger().info(f"Next CSQ poll in {delay:.1f} s")
+        self.get_logger().info(f"Next Iridium poll in {delay:.1f} s")
         self.timer = self.create_timer(delay, self.timer_callback)
 
     def timer_callback(self):
-        # Make this one-shot
         if self.timer is not None:
             self.timer.cancel()
 
-        self.poll_csq()
-
-        # Schedule next jittered poll
+        self.poll_iridium()
         self.schedule_next_poll()
 
-    def poll_csq(self):
+    def poll_iridium(self):
         try:
-            # Optional modem alive check
+            # 1) Modem alive check
             at_resp = self.send_at("AT")
             self.get_logger().info(f"AT response: {repr(at_resp)}")
 
+            # 2) Signal strength
             csq_resp = self.send_at("AT+CSQ")
             self.get_logger().info(f"CSQ response: {repr(csq_resp)}")
 
@@ -114,8 +149,26 @@ class IridiumCsqNode(Node):
                 self.publish_string(self.status_pub, "Could not parse CSQ")
                 self.get_logger().warn("Could not parse CSQ response")
 
+            # 3) Check for incoming MT message
+            sbdix_resp = self.send_at("AT+SBDIX", read_bytes=1024)
+            self.get_logger().info(f"SBDIX response: {repr(sbdix_resp)}")
+
+            if self.mt_message_present(sbdix_resp):
+                sbdrt_resp = self.send_at("AT+SBDRT", read_bytes=1024)
+                self.get_logger().info(f"SBDRT response: {repr(sbdrt_resp)}")
+
+                mt_text = self.clean_mt_response(sbdrt_resp)
+                if mt_text:
+                    self.publish_string(self.mt_pub, mt_text)
+                    self.publish_string(self.status_pub, f"Received MT: {mt_text}")
+                    self.get_logger().info(f"Published incoming MT message: {mt_text}")
+                else:
+                    self.publish_string(self.status_pub, "MT indicated, but message was empty")
+            else:
+                self.publish_string(self.status_pub, "No incoming MT message")
+
         except Exception as e:
-            err = f"Iridium CSQ poll error: {e}"
+            err = f"Iridium poll error: {e}"
             self.get_logger().error(err)
             self.publish_string(self.status_pub, err)
 
