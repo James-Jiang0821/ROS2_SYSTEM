@@ -6,8 +6,8 @@ def generate_launch_description():
     return LaunchDescription([
         Node(
             package='glider_ros',
-            executable='test_iridium_signal_node',
-            name='test_iridium_signal_node',
+            executable='iridium_signal_node',
+            name='iridium_signal_node',
             output='screen'
         ),
         Node(

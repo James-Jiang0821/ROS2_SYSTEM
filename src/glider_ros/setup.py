@@ -43,7 +43,7 @@ setup(
             'pressure_keller_node = glider_ros.drivers.pressure_keller_node:main',
             'fake_safety_node = glider_ros.safety.fake_safety_node:main',
             'telemetry_manager_node = glider_ros.manager.telemetry_manager_node:main',
-            'test_iridium_signal_node = glider_ros.drivers.test_iridium_signal_node:main',
+            'iridium_signal_node = glider_ros.tests.iridium_signal_node:main',
         ],
     },
 )
