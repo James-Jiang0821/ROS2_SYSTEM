@@ -12,7 +12,7 @@ class IridiumCsqNode(Node):
         super().__init__("iridium_csq_node")
 
         # Parameters
-        self.declare_parameter("port", "/dev/ttyAMA5")
+        self.declare_parameter("port", "/dev/ttyAMA2")
         self.declare_parameter("baud", 19200)
         self.declare_parameter("base_period", 20.0)   # seconds
         self.declare_parameter("jitter", 10.0)        # +/- seconds

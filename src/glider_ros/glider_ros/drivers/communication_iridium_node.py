@@ -47,7 +47,7 @@ class IridiumSbdNode(Node):
         # ----------------------------
         # Parameters
         # ----------------------------
-        self.declare_parameter("port", "/dev/ttyAMA5")
+        self.declare_parameter("port", "/dev/ttyAMA2")
         self.declare_parameter("baud", 19200)
         self.declare_parameter("serial_timeout", 0.5)
 
