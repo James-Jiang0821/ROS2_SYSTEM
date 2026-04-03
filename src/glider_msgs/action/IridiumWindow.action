@@ -1,0 +1,17 @@
+# Goal — what the state manager tells Iridium
+string latest_telemetry      # override outbound payload; empty = use whatever node already has
+int32 max_attempts           # typically 3
+float32 settling_time_s      # seconds to wait before first attempt, typically 60.0
+
+---
+# Result — what Iridium tells the state manager
+bool window_success          # true if the window ran to completion acceptably (even if no mission)
+bool mission_received        # true if an MT message arrived during this window
+string mission_text          # the received mission payload (empty if none)
+int32 attempts_used          # 1..max_attempts
+string status_message        # human-readable log/debug message
+
+---
+# Feedback — streamed while the action runs
+string phase                 # "SETTLING" | "ATTEMPT_N" | "BACKOFF" | "DONE"
+int32 attempt_number         # 0 during settling, 1..N during attempts

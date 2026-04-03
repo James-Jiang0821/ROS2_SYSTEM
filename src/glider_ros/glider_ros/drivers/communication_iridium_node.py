@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional
 
 import rclpy
+import rclpy.executors
+from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.node import Node
 from std_msgs.msg import String
 import serial
+
+from glider_msgs.action import IridiumWindow
 
 
 @dataclass
@@ -32,14 +36,6 @@ class SbdsxResult:
     msg_waiting: int
 
 
-class IridiumState(Enum):
-    IDLE = "IDLE"
-    SETTLING = "SETTLING"
-    ATTEMPTING = "ATTEMPTING"
-    BACKOFF = "BACKOFF"
-    DONE = "DONE"
-
-
 class IridiumSbdNode(Node):
     def __init__(self):
         super().__init__("communication_iridium_node")
@@ -50,39 +46,24 @@ class IridiumSbdNode(Node):
         self.declare_parameter("port", "/dev/ttyAMA2")
         self.declare_parameter("baud", 19200)
         self.declare_parameter("serial_timeout", 0.5)
-
-        # Timer-driven comms window
-        self.declare_parameter("cycle_period", 300.0)          # seconds between windows
-        self.declare_parameter("start_immediately", True)
-        self.declare_parameter("settle_time", 60.0)            # wait before first attempt
+        self.declare_parameter("settle_time", 60.0)
         self.declare_parameter("retry_delays", [60.0, 90.0, 120.0])
         self.declare_parameter("retry_jitter", 3.0)
-
-        # Modem/session
         self.declare_parameter("min_csq", 2)
         self.declare_parameter("sbd_session_timeout", 60)
         self.declare_parameter("sbd_text_max_len", 340)
-
-        # Logging/behavior
         self.declare_parameter("debug", False)
-        self.declare_parameter("tick_period", 1.0)
 
         self.port = self.get_parameter("port").value
         self.baud = int(self.get_parameter("baud").value)
         self.serial_timeout = float(self.get_parameter("serial_timeout").value)
-
-        self.cycle_period = float(self.get_parameter("cycle_period").value)
-        self.start_immediately = bool(self.get_parameter("start_immediately").value)
         self.settle_time = float(self.get_parameter("settle_time").value)
         self.retry_delays = [float(x) for x in self.get_parameter("retry_delays").value]
         self.retry_jitter = float(self.get_parameter("retry_jitter").value)
-
         self.min_csq = int(self.get_parameter("min_csq").value)
         self.sbd_session_timeout = int(self.get_parameter("sbd_session_timeout").value)
         self.sbd_text_max_len = int(self.get_parameter("sbd_text_max_len").value)
-
         self.debug = bool(self.get_parameter("debug").value)
-        self.tick_period = float(self.get_parameter("tick_period").value)
 
         # ----------------------------
         # Publishers
@@ -90,13 +71,12 @@ class IridiumSbdNode(Node):
         self.status_pub = self.create_publisher(String, "/iridium/status", 10)
         self.csq_pub = self.create_publisher(String, "/iridium/signal_strength", 10)
         self.mt_pub = self.create_publisher(String, "/iridium/incoming_message", 10)
-
         self.session_result_pub = self.create_publisher(String, "/iridium/session_result", 10)
         self.mo_status_pub = self.create_publisher(String, "/iridium/mo_status", 10)
         self.mt_waiting_pub = self.create_publisher(String, "/iridium/mt_waiting", 10)
 
         # ----------------------------
-        # Subscriber
+        # Subscriber — telemetry payload from telemetry_manager_node
         # ----------------------------
         self.sbdwt_sub = self.create_subscription(
             String,
@@ -106,24 +86,17 @@ class IridiumSbdNode(Node):
         )
 
         # ----------------------------
-        # Outbound message state
+        # Outbound payload state (lock protects access from sbdwt_callback
+        # thread vs action execute thread)
         # ----------------------------
+        self._lock = threading.Lock()
         self.pending_outbound: Optional[str] = None
         self.pending_outbound_dirty: bool = False
         self.last_written_outbound: Optional[str] = None
         self.last_successful_outbound: Optional[str] = None
 
-        # ----------------------------
-        # Comms window state
-        # ----------------------------
-        now = time.monotonic()
-        self.state = IridiumState.IDLE
-        self.window_active = False
-        self.window_settle_deadline = 0.0
-        self.backoff_deadline = 0.0
-        self.next_cycle_time = now if self.start_immediately else now + self.cycle_period
-        self.attempt_index = 0
-        self.last_csq: Optional[int] = None
+        # Prevent concurrent windows
+        self._window_in_progress = False
 
         # ----------------------------
         # Serial setup
@@ -146,8 +119,19 @@ class IridiumSbdNode(Node):
         # Configure modem once at startup
         self.configure_modem()
 
-        # Main state-machine tick
-        self.timer = self.create_timer(self.tick_period, self.tick)
+        # ----------------------------
+        # Action server
+        # ----------------------------
+        self._action_server = ActionServer(
+            self,
+            IridiumWindow,
+            "/iridium/run_window",
+            execute_callback=self.execute_window_callback,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
+        )
+
+        self.get_logger().info("Iridium node ready, waiting for action goals")
 
     # ------------------------------------------------------------------
     # ROS helpers
@@ -171,80 +155,146 @@ class IridiumSbdNode(Node):
     # ------------------------------------------------------------------
     def sbdwt_callback(self, msg: String):
         clean = self.sanitize_payload(msg.data)
-        self.pending_outbound = clean
-        self.pending_outbound_dirty = True
+        with self._lock:
+            self.pending_outbound = clean
+            self.pending_outbound_dirty = True
         self.log_debug(f"Updated pending outbound payload: {clean}")
 
     # ------------------------------------------------------------------
-    # Main state machine
+    # Action server callbacks
     # ------------------------------------------------------------------
-    def tick(self):
-        now = time.monotonic()
+    def goal_callback(self, goal_request):
+        if self._window_in_progress:
+            self.get_logger().warn("Rejecting goal: comms window already in progress")
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
 
-        if self.state == IridiumState.IDLE:
-            if now >= self.next_cycle_time:
-                self.start_comms_window()
-            return
+    def cancel_callback(self, goal_handle):
+        self.get_logger().info("Cancel requested for Iridium window")
+        return CancelResponse.ACCEPT
 
-        if self.state == IridiumState.SETTLING:
-            if now >= self.window_settle_deadline:
-                self.state = IridiumState.ATTEMPTING
-                self.publish_status("Iridium settling complete, starting attempt")
-            return
+    def execute_window_callback(self, goal_handle):
+        self._window_in_progress = True
+        try:
+            return self._run_window(goal_handle)
+        finally:
+            self._window_in_progress = False
 
-        if self.state == IridiumState.ATTEMPTING:
-            self.perform_attempt()
-            return
+    # ------------------------------------------------------------------
+    # Window execution (runs in action server thread)
+    # ------------------------------------------------------------------
+    def _run_window(self, goal_handle) -> IridiumWindow.Result:
+        goal = goal_handle.request
+        max_attempts = goal.max_attempts if goal.max_attempts > 0 else 3
+        settling_time = goal.settling_time_s if goal.settling_time_s > 0.0 else self.settle_time
 
-        if self.state == IridiumState.BACKOFF:
-            if now >= self.backoff_deadline:
-                self.state = IridiumState.ATTEMPTING
-                self.publish_status("Iridium backoff complete, retrying")
-            return
+        # If the goal provides telemetry, use it as the outbound payload override
+        if goal.latest_telemetry:
+            with self._lock:
+                self.pending_outbound = self.sanitize_payload(goal.latest_telemetry)
+                self.pending_outbound_dirty = True
 
-        if self.state == IridiumState.DONE:
-            if now >= self.next_cycle_time:
-                self.state = IridiumState.IDLE
-            return
+        feedback = IridiumWindow.Feedback()
 
-    def start_comms_window(self):
-        self.window_active = True
-        self.attempt_index = 0
-        self.window_settle_deadline = time.monotonic() + self.settle_time
-        self.state = IridiumState.SETTLING
+        # ---- Settling phase ----
+        feedback.phase = "SETTLING"
+        feedback.attempt_number = 0
+        goal_handle.publish_feedback(feedback)
+        self.publish_status(f"Settling for {settling_time:.0f}s")
+
+        deadline = time.monotonic() + settling_time
+        while time.monotonic() < deadline:
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                return IridiumWindow.Result()
+            time.sleep(1.0)
+
+        # ---- Attempt loop ----
+        window_success = False
+        mission_received = False
+        mission_text = ""
+        attempts_used = 0
+        status_message = "No attempts completed"
+
+        for i in range(max_attempts):
+            attempts_used = i + 1
+
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                return IridiumWindow.Result()
+
+            feedback.phase = f"ATTEMPT_{attempts_used}"
+            feedback.attempt_number = attempts_used
+            goal_handle.publish_feedback(feedback)
+            self.publish_status(f"Iridium attempt {attempts_used}/{max_attempts}")
+
+            attempt = self._run_one_attempt()
+            status_message = attempt["status"]
+
+            if attempt["success"]:
+                window_success = True
+                if attempt["mt_text"]:
+                    mission_received = True
+                    mission_text = attempt["mt_text"]
+                break
+
+            # Failed — backoff unless this was the last attempt
+            if i < max_attempts - 1:
+                idx = min(i, len(self.retry_delays) - 1)
+                base = self.retry_delays[idx]
+                delay = max(1.0, base + random.uniform(-self.retry_jitter, self.retry_jitter))
+                self.publish_status(f"Attempt {attempts_used} failed ({status_message}), backoff {delay:.1f}s")
+
+                feedback.phase = "BACKOFF"
+                goal_handle.publish_feedback(feedback)
+
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    if goal_handle.is_cancel_requested:
+                        goal_handle.canceled()
+                        return IridiumWindow.Result()
+                    time.sleep(1.0)
+
+        feedback.phase = "DONE"
+        goal_handle.publish_feedback(feedback)
         self.publish_status(
-            f"Starting Iridium comms window; settling for {self.settle_time:.0f}s"
+            f"Window done — success={window_success}, mission={mission_received}, "
+            f"attempts={attempts_used}"
         )
 
-    def finish_comms_window(self, reason: str):
-        self.window_active = False
-        self.state = IridiumState.DONE
-        self.next_cycle_time = time.monotonic() + self.cycle_period
-        self.publish_status(f"Ending comms window: {reason}")
+        result = IridiumWindow.Result()
+        result.window_success = window_success
+        result.mission_received = mission_received
+        result.mission_text = mission_text
+        result.attempts_used = attempts_used
+        result.status_message = status_message
+
+        goal_handle.succeed()
+        return result
 
     # ------------------------------------------------------------------
-    # Attempt logic
+    # Single SBD attempt
     # ------------------------------------------------------------------
-    def perform_attempt(self):
+    def _run_one_attempt(self) -> dict:
+        """
+        Run one full SBD session attempt.
+        Returns {'success': bool, 'mt_text': str, 'status': str}
+        """
         try:
-            self.attempt_index += 1
-            self.publish_status(f"Iridium attempt {self.attempt_index}")
-
             # Check modem alive
             at_resp = self.send_command("AT", timeout_s=5.0)
             if "OK" not in at_resp:
-                raise RuntimeError(f"AT failed: {repr(at_resp)}")
+                return {"success": False, "mt_text": "", "status": f"AT failed: {repr(at_resp)}"}
 
-            # Query signal
+            # Signal strength
             csq = self.get_csq()
-            self.last_csq = csq
             if csq is not None:
                 self.publish_string(self.csq_pub, str(csq))
                 self.publish_status(f"CSQ={csq}")
             else:
                 self.publish_status("Could not parse CSQ")
 
-            # Publish modem buffer/mailbox status if available
+            # Mailbox status
             sbdsx = self.get_sbdsx()
             if sbdsx is not None:
                 self.publish_string(
@@ -252,27 +302,27 @@ class IridiumSbdNode(Node):
                     f"mt_flag={sbdsx.mt_flag},msg_waiting={sbdsx.msg_waiting}"
                 )
 
-            # If signal is below desired threshold, skip this attempt
+            # Signal threshold check
             if csq is not None and csq < self.min_csq:
-                self.publish_status(
-                    f"CSQ below threshold ({csq} < {self.min_csq}), not attempting session"
-                )
-                self.handle_failed_attempt("low_csq")
-                return
+                return {
+                    "success": False,
+                    "mt_text": "",
+                    "status": f"CSQ below threshold ({csq}<{self.min_csq})",
+                }
 
-            # Always use the latest payload if present
-            if self.pending_outbound:
-                self.write_outbound_payload(self.pending_outbound)
+            # Write outbound payload if available
+            with self._lock:
+                outbound = self.pending_outbound
+                dirty = self.pending_outbound_dirty
 
-            # Run SBD session:
-            # - sends MO if MO buffer has data
-            # - checks mailbox for MT
+            if outbound:
+                self.write_outbound_payload(outbound, dirty)
+
+            # SBD session
             sbdix = self.run_sbdix()
             if sbdix is None:
-                self.handle_failed_attempt("could_not_parse_sbdix")
-                return
+                return {"success": False, "mt_text": "", "status": "Could not parse SBDIX response"}
 
-            # Publish detailed session result
             session_summary = (
                 f"mo_status={sbdix.mo_status},momsn={sbdix.momsn},"
                 f"mt_status={sbdix.mt_status},mtmsn={sbdix.mtmsn},"
@@ -283,69 +333,52 @@ class IridiumSbdNode(Node):
             self.publish_string(self.mt_waiting_pub, str(sbdix.mt_queued))
             self.log_debug(f"SBDIX parsed: {session_summary}")
 
-            # If MT message arrived, read and publish it
+            # Read MT message if one arrived
+            mt_text = ""
             if sbdix.mt_len > 0:
                 mt_text = self.read_mt_message()
                 if mt_text:
                     self.publish_string(self.mt_pub, mt_text)
                     self.publish_status(f"Received MT: {mt_text}")
                 else:
-                    self.publish_status("MT indicated by SBDIX, but MT buffer read empty")
+                    self.publish_status("MT indicated by SBDIX but buffer read empty")
 
-            # Success policy:
-            # Treat mo_status 0..4 as success range for a completed session.
-            # This is a practical success gate for mailbox checks and normal MO sessions.
             if self.is_session_success(sbdix.mo_status):
-                if self.pending_outbound:
-                    self.last_successful_outbound = self.pending_outbound
-                    self.pending_outbound_dirty = False
+                with self._lock:
+                    if outbound:
+                        self.last_successful_outbound = outbound
+                        self.pending_outbound_dirty = False
+                return {
+                    "success": True,
+                    "mt_text": mt_text,
+                    "status": f"Session success (mo_status={sbdix.mo_status})",
+                }
 
-                self.finish_comms_window("session_success")
-                return
-
-            # Otherwise failed
-            self.handle_failed_attempt(f"mo_status_{sbdix.mo_status}")
+            return {
+                "success": False,
+                "mt_text": "",
+                "status": f"Session failed (mo_status={sbdix.mo_status})",
+            }
 
         except Exception as e:
-            error_text = f"Iridium attempt error: {str(e)}"
-            self.get_logger().error(error_text)
-            self.publish_status(error_text)
-            self.handle_failed_attempt("exception")
-
-    def handle_failed_attempt(self, reason: str):
-        if self.attempt_index >= len(self.retry_delays):
-            self.finish_comms_window(f"attempts_exhausted ({reason})")
-            return
-
-        base_delay = self.retry_delays[self.attempt_index - 1]
-        jitter = random.uniform(-self.retry_jitter, self.retry_jitter)
-        delay = max(1.0, base_delay + jitter)
-
-        self.backoff_deadline = time.monotonic() + delay
-        self.state = IridiumState.BACKOFF
-        self.publish_status(
-            f"Attempt failed ({reason}), retrying in {delay:.1f}s"
-        )
+            error = f"Attempt exception: {e}"
+            self.get_logger().error(error)
+            self.publish_status(error)
+            return {"success": False, "mt_text": "", "status": error}
 
     # ------------------------------------------------------------------
     # Modem configuration
     # ------------------------------------------------------------------
     def configure_modem(self):
         try:
-            # Basic liveness
             self.send_command("AT", timeout_s=5.0)
-
-            # Disable echo for cleaner parsing
             self.send_command("ATE0", timeout_s=5.0)
-
-            # Set SBD session timeout
             self.send_command(f"AT+SBDST={self.sbd_session_timeout}", timeout_s=5.0)
-
             self.publish_status("Iridium modem configured")
         except Exception as e:
-            error_text = f"Failed to configure modem: {str(e)}"
-            self.get_logger().error(error_text)
-            self.publish_status(error_text)
+            error = f"Failed to configure modem: {e}"
+            self.get_logger().error(error)
+            self.publish_status(error)
 
     # ------------------------------------------------------------------
     # Serial / AT helpers
@@ -354,12 +387,8 @@ class IridiumSbdNode(Node):
         self,
         cmd: str,
         timeout_s: float = 10.0,
-        end_tokens=("OK", "ERROR", "READY")
+        end_tokens=("OK", "ERROR", "READY"),
     ) -> str:
-        """
-        Send an AT command and read until an expected terminator appears
-        or timeout expires.
-        """
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
 
@@ -385,7 +414,7 @@ class IridiumSbdNode(Node):
     def sanitize_payload(self, payload: str) -> str:
         text = payload.replace("\r", " ").replace("\n", " ").strip()
         if len(text) > self.sbd_text_max_len:
-            text = text[:self.sbd_text_max_len]
+            text = text[: self.sbd_text_max_len]
         return text
 
     # ------------------------------------------------------------------
@@ -405,7 +434,6 @@ class IridiumSbdNode(Node):
         match = re.search(r"\+SBDSX:\s*([0-9,\s-]+)", resp)
         if not match:
             return None
-
         try:
             nums = [int(x.strip()) for x in match.group(1).split(",")]
             if len(nums) >= 6:
@@ -421,28 +449,22 @@ class IridiumSbdNode(Node):
             return None
         return None
 
-    def write_outbound_payload(self, payload: str):
+    def write_outbound_payload(self, payload: str, dirty: bool = True):
         clean = self.sanitize_payload(payload)
         if not clean:
             self.publish_status("Outbound payload empty, skipping SBDWT")
             return
-
-        # Only rewrite if it changed or was never written
-        if clean == self.last_written_outbound and not self.pending_outbound_dirty:
+        if clean == self.last_written_outbound and not dirty:
             self.log_debug("Outbound payload unchanged, not rewriting MO buffer")
             return
-
         resp = self.send_command(f"AT+SBDWT={clean}", timeout_s=10.0)
         self.log_debug(f"SBDWT response: {repr(resp)}")
-
         if "OK" not in resp:
             raise RuntimeError(f"SBDWT failed: {repr(resp)}")
-
         self.last_written_outbound = clean
         self.publish_status(f"Loaded MO payload: {clean}")
 
     def run_sbdix(self) -> Optional[SbdixResult]:
-        # Give it enough time for the session plus some margin
         timeout_s = float(self.sbd_session_timeout + 20)
         resp = self.send_command("AT+SBDIX", timeout_s=timeout_s)
         self.log_debug(f"SBDIX response: {repr(resp)}")
@@ -452,7 +474,6 @@ class IridiumSbdNode(Node):
         match = re.search(r"\+SBDIX:\s*([0-9,\s-]+)", response)
         if not match:
             return None
-
         try:
             nums = [int(x.strip()) for x in match.group(1).split(",")]
             if len(nums) >= 6:
@@ -477,22 +498,12 @@ class IridiumSbdNode(Node):
         lines = []
         for line in response.splitlines():
             stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped == "OK":
-                continue
-            if stripped == "ERROR":
-                continue
-            if stripped == "AT+SBDRT":
+            if stripped in ("", "OK", "ERROR", "AT+SBDRT"):
                 continue
             lines.append(stripped)
         return "\n".join(lines).strip()
 
     def is_session_success(self, mo_status: int) -> bool:
-        """
-        Practical success rule for v1:
-        treat low MO status codes as completed session outcomes.
-        """
         return 0 <= mo_status <= 4
 
     # ------------------------------------------------------------------
@@ -510,8 +521,13 @@ class IridiumSbdNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = IridiumSbdNode()
+    # MultiThreadedExecutor lets the action execute_callback run in its own
+    # thread while the main executor continues processing other callbacks
+    # (e.g. sbdwt_callback, publishers) during the long blocking window.
+    executor = rclpy.executors.MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
         node.destroy_node()
         rclpy.shutdown()

@@ -45,6 +45,7 @@ setup(
             'telemetry_manager_node = glider_ros.manager.telemetry_manager_node:main',
             'iridium_signal_node = glider_ros.tests.iridium_signal_node:main',
             'bridge_catch_iridium_node = glider_ros.tests.bridge_catch_iridium_node:main',
+            'state_manager_node = glider_ros.manager.state_manager_node:main',
         ],
     },
 )
