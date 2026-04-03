@@ -1,390 +1,302 @@
-"""
-CAN Bridge Node for UCL Underwater Glider
-Handles communication between the Pi (ROS2) and 3 Teensys over CAN bus.
-Matches the Notion VBD Teensy and P&R Teensy spec exactly.
-"""
+#!/usr/bin/env python3
 
+
+import struct
+import threading
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64, Bool, String
-import struct
-import can
+from std_msgs.msg import Float64, Bool, UInt8, String
 
-# CAN message bases — add node_id to get actual CAN ID
-# Lower ID = higher priority on the bus
-FAULT_BASE  = 0x050     # Teensy -> Pi, 2Hz,  fault reports
-CMD_BASE    = 0x100     # Pi -> Teensy, 20Hz, position commands
-STATUS_BASE = 0x200     # Teensy -> Pi, 50Hz, position + motor state
-BMS_BASE    = 0x210     # Teensy -> Pi, 1Hz,  battery health
 
-# Teensy node IDs
-VBD_L = 1
-VBD_R = 2
-PR    = 3
+VBD_L  = 1
+VBD_R  = 2
+PR     = 3
 
-# Position scaling
-# Teensy packs est_position as (pos_mm * 100) — hundredths of mm, uint16 LE.
-# e.g. 150 mm -> raw value 15000. Divide by 100 to recover mm.
-VBD_STROKE_MIN_MM = 10.0
-VBD_RAW_PER_MM  = 100.0     # Teensy multiplies mm by this before packing
-VBD_STROKE_MAX_MM = 145.0   # full VBD stroke in mm (0-1 normalisation)
-PR_STROKE_MAX_MM  = 110.0   # full P&R stroke in mm
-
-# All 19 faults from Notion spec
-# Key = (byte number, bit number), value = fault name
-HARD_FAULTS = {
-    (0, 0): "LEAK",        (0, 1): "DRIVER_FLT",
-    (0, 2): "OVERCURRENT", (0, 3): "STALL",
-    (0, 4): "CMD_TO_L",    (0, 5): "NOT_HOMED",
-    (0, 6): "POS_LIM",     (0, 7): "BMS_TEMP",
-    (1, 0): "BMS_TO_L",    (1, 1): "BMS_OC",
-    (1, 2): "BMS_SWITCH",
-}
-
-SOFT_FAULTS = {
-    (2, 0): "CMD_TO",      (2, 1): "TOF_INV",
-    (2, 2): "TOF_OOR",     (2, 3): "SLIP",
-    (2, 4): "ENCODER_INV", (2, 5): "BMS_TO",
-    (2, 6): "BMS_LOW",     (2, 7): "BMS_HIGH",
-}
+CMD_BASE    = 0x100
+STATUS_BASE = 0x200
+FAULT_BASE  = 0x050
+BMS_BASE    = 0x210
 
 
 class CanBridgeNode(Node):
+
     def __init__(self):
-        super().__init__("can_bridge_node")
+        super().__init__('can_bridge_node')
 
-        # CAN setup
-        self.declare_parameter("can_channel", "can0")
-        self.declare_parameter("can_bitrate", 500000)
-        channel = self.get_parameter("can_channel").value
-        bitrate = self.get_parameter("can_bitrate").value
+        self.declare_parameter('can_channel', 'can0')
+        self.declare_parameter('republish_rate_hz', 20.0)
+
+        channel = self.get_parameter('can_channel').value
 
         try:
-            self.bus = can.interface.Bus(channel=channel, bustype="socketcan", bitrate=bitrate)
-            self.get_logger().info(f"CAN connected on {channel} at {bitrate} bps")
+            import can as _can
+            self.can = _can
+            self.bus = _can.interface.Bus(channel=channel, bustype='socketcan')
+            self.get_logger().info(f'CAN bus opened on {channel}')
         except Exception as e:
-            self.get_logger().error(f"Failed to open CAN bus: {e}")
-            self.bus = None
-            return
+            self.get_logger().error(f'Failed to open CAN: {e}')
+            raise
 
-        # Data from Teensys (updated by read_can)
-        self.vbd_left_pos  = 0.0    # 0.0 to 1.0
-        self.vbd_right_pos = 0.0
-        self.pitch_angle   = 0.0    # degrees
-        self.roll_angle    = 0.0    # degrees
+        self.seq_pr = 0
+        self.seq_vbd_l = 0
+        self.seq_vbd_r = 0
 
-        self.leak_left  = False
-        self.leak_right = False
-        self.leak_pr    = False
+        self._setup_pr_interface()
+        self._setup_vbd_interface('left', VBD_L)
+        self._setup_vbd_interface('right', VBD_R)
 
-        self.batt_left_v     = 0.0  # volts
-        self.batt_right_v    = 0.0
-        self.batt_left_temp  = 0    # tenths of degree C
-        self.batt_right_temp = 0
+        self._running = True
+        self._rx_thread = threading.Thread(target=self._can_rx_loop, daemon=True)
+        self._rx_thread.start()
 
-        self.state_left  = "UNKNOWN"
-        self.state_right = "UNKNOWN"
-        self.state_pr    = "UNKNOWN"
+        rate = self.get_parameter('republish_rate_hz').value
+        self.create_timer(1.0 / rate, self._republish_commands)
 
-        self.first_fault_left  = 0
-        self.first_fault_right = 0
-        self.seq_left  = 0
-        self.seq_right = 0
+        self.get_logger().info('CAN bridge running')
 
-        self.tof_left_mm  = 0.0         # raw ToF distance in mm
-        self.tof_right_mm = 0.0
+    # ── Interface setup ──
 
-        # Commands to Teensys (set by callbacks, sent by send_commands)
-        self.target_vbd_left  = 0   # stroke percentage 0-100
-        self.target_vbd_right = 0
-        self.target_pitch     = 50  # percentage, 50 = level = 0 degrees
-        self.motors_enabled   = False
-        self.homing_requested = False
-        self.emergency        = False
-        self.cmd_seq          = 0   # outgoing sequence counter
+    def _setup_pr_interface(self):
+        self.pr_pitch_mm = 0.0
+        self.pr_roll_deg = 0.0
+        self.pr_enable = False
+        self.pr_home = False
 
-        # Publishers
-        self.pub_vbd_left    = self.create_publisher(Float64, "/ug/vbd/left/position",    10)
-        self.pub_vbd_right   = self.create_publisher(Float64, "/ug/vbd/right/position",   10)
-        self.pub_pitch       = self.create_publisher(Float64, "/ug/pitch/angle",           10)
-        self.pub_roll        = self.create_publisher(Float64, "/ug/roll/angle",            10)
-        self.pub_leak_left   = self.create_publisher(Bool,    "/ug/leak/left",             10)
-        self.pub_leak_right  = self.create_publisher(Bool,    "/ug/leak/right",            10)
-        self.pub_leak_pr     = self.create_publisher(Bool,    "/ug/leak/pr",               10)
-        self.pub_batt_left   = self.create_publisher(Float64, "/ug/battery/left",          10)
-        self.pub_batt_right  = self.create_publisher(Float64, "/ug/battery/right",         10)
-        self.pub_teensy_left = self.create_publisher(String,  "/ug/teensy/vbd_left/status", 10)
-        self.pub_teensy_right= self.create_publisher(String,  "/ug/teensy/vbd_right/status",10)
-        self.pub_teensy_pr   = self.create_publisher(String,  "/ug/teensy/pr/status",      10)
-        self.pub_tof_left    = self.create_publisher(Float64, "/ug/tof/left",               10)
-        self.pub_tof_right   = self.create_publisher(Float64, "/ug/tof/right",              10)
-        self.pub_all         = self.create_publisher(String,  "/ug/raw",                   10)
+        self.create_subscription(Float64, '/cmd/pitch_mm', self._cb_pr_pitch, 10)
+        self.create_subscription(Float64, '/cmd/roll_deg', self._cb_pr_roll, 10)
+        self.create_subscription(Bool, '/cmd/pr_enable', self._cb_pr_enable, 10)
+        self.create_subscription(Bool, '/cmd/pr_home', self._cb_pr_home, 10)
 
-        # Subscribers
-        self.create_subscription(Float64, "/ug/cmd/vbd/left",  self.on_cmd_vbd_left,  10)
-        self.create_subscription(Float64, "/ug/cmd/vbd/right", self.on_cmd_vbd_right, 10)
-        self.create_subscription(Float64, "/ug/cmd/pitch",     self.on_cmd_pitch,     10)
-        self.create_subscription(Float64, "/ug/cmd/roll",      self.on_cmd_roll,      10)
-        self.create_subscription(Bool,    "/ug/cmd/emergency", self.on_cmd_emergency, 10)
+        self.pub_pr_pitch_pos = self.create_publisher(Float64, '/feedback/pr/pitch_pos_mm', 10)
+        self.pub_pr_roll_pos = self.create_publisher(Float64, '/feedback/pr/roll_pos_deg', 10)
+        self.pub_pr_tof = self.create_publisher(Float64, '/feedback/pr/tof_mm', 10)
+        self.pub_pr_leak = self.create_publisher(Bool, '/feedback/pr/leak', 10)
+        self.pub_pr_pitch_homed = self.create_publisher(Bool, '/feedback/pr/pitch_homed', 10)
+        self.pub_pr_roll_homed = self.create_publisher(Bool, '/feedback/pr/roll_homed', 10)
+        self.pub_pr_status = self.create_publisher(String, '/feedback/pr/status_flags', 10)
+        self.pub_pr_seq = self.create_publisher(UInt8, '/feedback/pr/seq', 10)
+        self.pub_pr_fault = self.create_publisher(String, '/feedback/pr/fault', 10)
+        self.pub_pr_bms_v = self.create_publisher(Float64, '/feedback/pr/bms_voltage_v', 10)
+        self.pub_pr_bms_t = self.create_publisher(Float64, '/feedback/pr/bms_temp_c', 10)
+        self.pub_pr_bms_flag = self.create_publisher(UInt8, '/feedback/pr/bms_flag', 10)
 
-        # Timers
-        self.create_timer(0.02, self.read_can)         # 50 Hz
-        self.create_timer(0.05, self.send_commands)    # 20 Hz
-        self.create_timer(0.1,  self.publish_feedback) # 10 Hz
-        self.create_timer(1.0,  self.publish_health)   #  1 Hz
+    def _setup_vbd_interface(self, side, node_id):
+        setattr(self, f'vbd_{side}_mm', 0.0)
+        setattr(self, f'vbd_{side}_enable', False)
+        setattr(self, f'vbd_{side}_home', False)
 
-        self.get_logger().info("Bridge node ready")
+        self.create_subscription(
+            Float64, f'/cmd/vbd_{side}_mm',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_mm', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/cmd/vbd_{side}_enable',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_enable', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/cmd/vbd_{side}_home',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_home', msg.data), 10)
 
-    # ===========================================
-    # READING CAN MESSAGES
-    # ===========================================
+        for name, typ in [('pos_mm', Float64), ('leak', Bool), ('seq', UInt8),
+                          ('fault', String), ('bms_voltage_v', Float64),
+                          ('bms_temp_c', Float64), ('bms_flag', UInt8)]:
+            setattr(self, f'pub_vbd_{side}_{name}',
+                self.create_publisher(typ, f'/feedback/vbd_{side}/{name}', 10))
 
-    def read_can(self):
-        if not self.bus:
-            return
-        while True:
-            msg = self.bus.recv(timeout=0.0)
-            if msg is None:
-                break
-            self.route_message(msg.arbitration_id, msg.data)
+    # ── Command callbacks ──
 
-    def route_message(self, can_id, data):
-        # Node IDs are 1-3 so use inclusive bounds
-        if STATUS_BASE + 1 <= can_id <= STATUS_BASE + 3:
-            self.parse_status(can_id - STATUS_BASE, data)
-        elif FAULT_BASE + 1 <= can_id <= FAULT_BASE + 3:
-            self.parse_fault(can_id - FAULT_BASE, data)
-        elif BMS_BASE + 1 <= can_id <= BMS_BASE + 3:
-            self.parse_bms(can_id - BMS_BASE, data)
+    def _cb_pr_pitch(self, msg):
+        self.pr_pitch_mm = max(-56.9, min(56.9, msg.data))
 
-    def parse_status(self, node_id, data):
-        """Parse STATUS_CONTROL (0x200+id).
+    def _cb_pr_roll(self, msg):
+        self.pr_roll_deg = max(-90.0, min(90.0, msg.data))
 
-        Teensy frame layout (all little-endian):
-          Bytes 0-1  est_position_01mm  uint16  pos_mm * 100 (hundredths of mm)
-          Bytes 2-3  tof_position_mm    uint16  raw mm from ToF
-          Byte  4    flags              uint8   bit1=LEAK, bit3=HOMED,
-                                                bit4=MOVING, bit5=MOTOR_EN,
-                                                bit6=DIR, bit7=DRIVER_FLT
-          Byte  5    pwm                uint8   0-255
-          Byte  6    sequence           uint8
-          Byte  7    motor_current      int8    0.1 A/LSB
-        """
-        if len(data) < 8:
-            return
+    def _cb_pr_enable(self, msg):
+        self.pr_enable = msg.data
 
-        # Position: Teensy sends pos_mm * 100, so divide by 100 to get mm
-        raw_pos = struct.unpack_from('<H', data, 0)[0]
-        pos_mm  = raw_pos / VBD_RAW_PER_MM
+    def _cb_pr_home(self, msg):
+        self.pr_home = msg.data
 
-        # ToF position in mm
-        tof_mm = struct.unpack_from('<H', data, 2)[0]
+    # ── Outgoing: ROS topics -> CAN frames ──
 
-        # Status flags
-        flags    = data[4]
-        leak     = bool(flags & (1 << 1))
-        homed    = bool(flags & (1 << 3))
-        moving   = bool(flags & (1 << 4))
-        motor_on = bool(flags & (1 << 5))
+    def _republish_commands(self):
+        self._send_pr_cmd()
+        self._send_vbd_cmd(VBD_L, 'left')
+        self._send_vbd_cmd(VBD_R, 'right')
 
-        # PWM and current
-        pwm     = data[5]
-        current = struct.unpack_from('<b', data, 7)[0]  # signed int8
+    def _send_pr_cmd(self):
+        pitch_raw = int(round(self.pr_pitch_mm * 10))
+        roll_raw = int(round(self.pr_roll_deg * 10))
+        cmd_bits = (0x01 if self.pr_enable else 0) | (0x02 if self.pr_home else 0)
+        self.seq_pr = (self.seq_pr + 1) & 0xFF
 
-        if node_id == VBD_L:
-            self.vbd_left_pos = (pos_mm-VBD_STROKE_MIN_MM) / (VBD_STROKE_MAX_MM-VBD_STROKE_MIN_MM)
-            self.leak_left    = leak
-            self.tof_left_mm  = float(tof_mm)
-        elif node_id == VBD_R:
-            self.vbd_right_pos = (pos_mm-VBD_STROKE_MIN_MM) / (VBD_STROKE_MAX_MM-VBD_STROKE_MIN_MM)
-            self.leak_right    = leak
-            self.tof_right_mm  = float(tof_mm)
-        elif node_id == PR:
-            # Map stroke mm to pitch angle: 0 mm = -25 deg, max mm = +25 deg
-            self.pitch_angle = (pos_mm / PR_STROKE_MAX_MM) * 50.0 - 25.0
-            self.leak_pr     = leak
+        data = struct.pack('>hhBxBx', pitch_raw, roll_raw, cmd_bits, self.seq_pr)
+        self._tx(CMD_BASE + PR, data)
 
-    def parse_fault(self, node_id, data):
-        """Parse STATUS_FAULT (0x050+id): fault bits, state, first fault, seq"""
-        if len(data) < 7:
-            return
+    def _send_vbd_cmd(self, node_id, side):
+        pos_mm = getattr(self, f'vbd_{side}_mm')
+        enable = getattr(self, f'vbd_{side}_enable')
+        home = getattr(self, f'vbd_{side}_home')
+        pos_raw = int(round(pos_mm * 10))
+        cmd_bits = (0x01 if enable else 0) | (0x02 if home else 0)
 
-        hard = [name for (b, bit), name in HARD_FAULTS.items() if (data[b] >> bit) & 1]
-        soft = [name for (b, bit), name in SOFT_FAULTS.items() if (data[b] >> bit) & 1]
+        attr = f'seq_vbd_{"l" if node_id == VBD_L else "r"}'
+        seq = (getattr(self, attr) + 1) & 0xFF
+        setattr(self, attr, seq)
 
-        first_fault = data[4]
+        data = struct.pack('>hxxBxBx', pos_raw, cmd_bits, seq)
+        self._tx(CMD_BASE + node_id, data)
 
-        state_byte = data[5]
-        if   state_byte & 1: state = "INIT"
-        elif state_byte & 2: state = "RUN"
-        elif state_byte & 4: state = "FAULT"
-        else:                state = "UNKNOWN"
-
-        seq         = data[6]
-        fault_text  = ",".join(hard + soft) if (hard or soft) else "OK"
-        status_text = f"{state}:{fault_text}"
-
-        if node_id == VBD_L:
-            self.state_left        = status_text
-            self.first_fault_left  = first_fault
-            self.seq_left          = seq
-            if "LEAK" in hard:
-                self.leak_left = True
-        elif node_id == VBD_R:
-            self.state_right       = status_text
-            self.first_fault_right = first_fault
-            self.seq_right         = seq
-            if "LEAK" in hard:
-                self.leak_right = True
-        elif node_id == PR:
-            self.state_pr = status_text
-            if "LEAK" in hard:
-                self.leak_pr = True
-
-    def parse_bms(self, node_id, data):
-        """Parse STATUS_BMS (0x210+id): voltage, temp, BMS faults"""
-        if len(data) < 5:
-            return
-
-        volts = struct.unpack_from('<H', data, 0)[0] / 1000.0  # millivolts -> volts
-        temp  = struct.unpack_from('<h', data, 2)[0]            # signed, tenths of deg C
-
-        if node_id == VBD_L:
-            self.batt_left_v    = volts
-            self.batt_left_temp = temp
-        elif node_id == VBD_R:
-            self.batt_right_v    = volts
-            self.batt_right_temp = temp
-
-    # ===========================================
-    # SENDING CAN COMMANDS
-    # ===========================================
-
-    def send_commands(self):
-        """Send CMD_SETPOINT to all 3 Teensys at 20 Hz"""
-        if not self.bus:
-            return
-        self.cmd_seq = (self.cmd_seq + 1) % 256
-        self.send_setpoint(CMD_BASE + VBD_L, self.target_vbd_left)
-        self.send_setpoint(CMD_BASE + VBD_R, self.target_vbd_right)
-        self.send_setpoint(CMD_BASE + PR,    self.target_pitch)
-
-    def send_setpoint(self, can_id, stroke_percent):
-        """Build and send one CMD_SETPOINT frame.
-
-        Byte 0  stroke_percent  uint8   0-100
-        Byte 3  ctrl flags      uint8   bit0=ENABLE, bit1=HOMING
-        Byte 6  sequence        uint8
-        """
-        frame    = bytearray(8)
-        frame[0] = max(0, min(100, int(stroke_percent)))
-
-        ctrl = 0
-        if self.motors_enabled:   ctrl |= (1 << 0)
-        if self.homing_requested: ctrl |= (1 << 1)
-        frame[3] = ctrl
-        frame[6] = self.cmd_seq
-
+    def _tx(self, can_id, data):
+        msg = self.can.Message(arbitration_id=can_id, data=data, is_extended_id=False)
         try:
-            self.bus.send(can.Message(
-                arbitration_id=can_id,
-                data=bytes(frame),
-                is_extended_id=False
-            ))
-        except can.CanError as e:
-            self.get_logger().error(f"CAN send error 0x{can_id:03X}: {e}")
+            self.bus.send(msg)
+        except Exception as e:
+            self.get_logger().warn(f'CAN TX 0x{can_id:03X} failed: {e}')
 
-    # ===========================================
-    # COMMAND CALLBACKS
-    # ===========================================
+    # ── Incoming: CAN frames -> ROS topics ──
 
-    def on_cmd_vbd_left(self, msg):
-        """ROS2 0.0-1.0 -> CAN stroke percentage 0-100"""
-        self.target_vbd_left = int(max(0.0, min(1.0, msg.data)) * 100)
-        self.motors_enabled  = True
+    def _can_rx_loop(self):
+        while self._running:
+            msg = self.bus.recv(timeout=0.1)
+            if msg is None:
+                continue
+            cid = msg.arbitration_id
+            d = msg.data
 
-    def on_cmd_vbd_right(self, msg):
-        self.target_vbd_right = int(max(0.0, min(1.0, msg.data)) * 100)
-        self.motors_enabled   = True
+            for base, handler in [(STATUS_BASE, self._parse_status),
+                                  (FAULT_BASE, self._parse_fault),
+                                  (BMS_BASE, self._parse_bms)]:
+                node_id = cid - base
+                if node_id in (VBD_L, VBD_R, PR):
+                    handler(node_id, d)
+                    break
 
-    def on_cmd_pitch(self, msg):
-        """ROS2 degrees -> CAN percentage. -25 deg=0%, 0 deg=50%, +25 deg=100%"""
-        deg = max(-25.0, min(25.0, msg.data))
-        self.target_pitch   = int(((deg + 25.0) / 50.0) * 100.0)
-        self.motors_enabled = True
+    def _parse_status(self, node_id, d):
+        if len(d) < 8:
+            return
 
-    def on_cmd_roll(self, msg):
-        pass  # TODO: define roll CAN frame with team
+        if node_id == PR:
+            pitch_raw, roll_raw = struct.unpack_from('>hh', d, 0)
+            b4, b5, seq = d[4], d[5], d[6]
+            tof = struct.unpack_from('>b', d, 7)[0]
 
-    def on_cmd_emergency(self, msg):
-        if msg.data:
-            self.emergency        = True
-            self.target_vbd_left  = 100     # fully extended = buoyant
-            self.target_vbd_right = 100
-            self.target_pitch     = 50      # level
-            self.motors_enabled   = True
-            self.get_logger().warn("EMERGENCY SURFACE")
+            self._pub_f64(self.pub_pr_pitch_pos, pitch_raw / 10.0)
+            self._pub_f64(self.pub_pr_roll_pos, roll_raw / 10.0)
+            self._pub_f64(self.pub_pr_tof, float(tof))
+            self._pub_bool(self.pub_pr_leak, bool(b5 & 0x04))
+            self._pub_bool(self.pub_pr_pitch_homed, bool(b4 & 0x04))
+            self._pub_bool(self.pub_pr_roll_homed, bool(b4 & 0x08))
+            self._pub_u8(self.pub_pr_seq, seq)
+
+            flags = self._decode_pr_flags(b4, b5)
+            s = String(); s.data = ','.join(flags) if flags else 'none'
+            self.pub_pr_status.publish(s)
+
+        elif node_id in (VBD_L, VBD_R):
+            side = 'left' if node_id == VBD_L else 'right'
+            pos_raw = struct.unpack_from('>h', d, 0)[0]
+            b5, seq = d[5], d[6]
+            leak = bool(b5 & 0x04)
+
+            self._pub_f64(getattr(self, f'pub_vbd_{side}_pos_mm'), pos_raw / 10.0)
+            self._pub_bool(getattr(self, f'pub_vbd_{side}_leak'), leak)
+            self._pub_u8(getattr(self, f'pub_vbd_{side}_seq'), seq)
+
+    def _parse_fault(self, node_id, d):
+        if len(d) < 8:
+            return
+
+        hard_names_b0 = ['LEAK','DRIVER_PITCH','DRIVER_ROLL','CMD_TO_L',
+                         'PITCH_N_HOME','ROLL_N_HOME','BMS_TEMP','BMS_TO_L']
+        hard_names_b1 = ['BMS_OC','BMS_SWITCH','STALL_PITCH','STALL_ROLL']
+        soft_names_b2 = ['CMD_TO','TOF_INV','BMS_TO','BMS_LOW','BMS_HIGH']
+
+        hards = [n for i, n in enumerate(hard_names_b0) if d[0] & (1 << i)]
+        hards += [n for i, n in enumerate(hard_names_b1) if d[1] & (1 << i)]
+        softs = [n for i, n in enumerate(soft_names_b2) if d[2] & (1 << i)]
+        state = d[5]
+        state_names = ['UNHOMED','HOMING','RUN','HOLD','FAULT']
+        state_str = state_names[state] if state < len(state_names) else f'UNK({state})'
+
+        if node_id == PR:
+            pub = self.pub_pr_fault
         else:
-            self.emergency = False
+            side = 'left' if node_id == VBD_L else 'right'
+            pub = getattr(self, f'pub_vbd_{side}_fault')
 
-    # ===========================================
-    # PUBLISHING TO ROS2
-    # ===========================================
+        if hards:
+            s = String(); s.data = f'HARD:{",".join(hards)}|state:{state_str}'
+            pub.publish(s)
+            self.get_logger().error(f'Node {node_id} HARD: {",".join(hards)}')
+        elif softs:
+            s = String(); s.data = f'SOFT:{",".join(softs)}|state:{state_str}'
+            pub.publish(s)
+            self.get_logger().warn(f'Node {node_id} soft: {",".join(softs)}')
+        else:
+            s = String(); s.data = f'OK|state:{state_str}'
+            pub.publish(s)
 
-    def publish_feedback(self):
-        """10 Hz: push Teensy positions to ROS2"""
-        self.pub_float(self.pub_vbd_left,  self.vbd_left_pos)
-        self.pub_float(self.pub_vbd_right, self.vbd_right_pos)
-        self.pub_float(self.pub_pitch,     self.pitch_angle)
-        self.pub_float(self.pub_roll,      self.roll_angle)
-        self.pub_float(self.pub_tof_left,  self.tof_left_mm)
-        self.pub_float(self.pub_tof_right, self.tof_right_mm)
+    def _parse_bms(self, node_id, d):
+        if len(d) < 7:
+            return
 
-    def publish_health(self):
-        """1 Hz: push leaks, batteries, Teensy states to ROS2"""
-        self.pub_bool(self.pub_leak_left,  self.leak_left)
-        self.pub_bool(self.pub_leak_right, self.leak_right)
-        self.pub_bool(self.pub_leak_pr,    self.leak_pr)
+        pack_mv, temp_raw = struct.unpack_from('>Hh', d, 0)
+        bms_flag = d[4]
+        voltage_v = pack_mv / 1000.0
+        temp_c = temp_raw / 10.0
 
-        self.pub_float(self.pub_batt_left,  self.batt_left_v)
-        self.pub_float(self.pub_batt_right, self.batt_right_v)
+        if node_id == PR:
+            pv, pt, pf = self.pub_pr_bms_v, self.pub_pr_bms_t, self.pub_pr_bms_flag
+        else:
+            side = 'left' if node_id == VBD_L else 'right'
+            pv = getattr(self, f'pub_vbd_{side}_bms_voltage_v')
+            pt = getattr(self, f'pub_vbd_{side}_bms_temp_c')
+            pf = getattr(self, f'pub_vbd_{side}_bms_flag')
 
-        self.pub_str(self.pub_teensy_left,  self.state_left)
-        self.pub_str(self.pub_teensy_right, self.state_right)
-        self.pub_str(self.pub_teensy_pr,    self.state_pr)
+        self._pub_f64(pv, voltage_v)
+        self._pub_f64(pt, temp_c)
+        self._pub_u8(pf, bms_flag)
 
-        self.pub_str(self.pub_all,
-            f"pos_l={self.vbd_left_pos:.3f} pos_r={self.vbd_right_pos:.3f} "
-            f"tof_l={self.tof_left_mm:.1f}mm tof_r={self.tof_right_mm:.1f}mm "
-            f"pitch={self.pitch_angle:+.1f}deg "
-            f"leak_l={self.leak_left} leak_r={self.leak_right} leak_pr={self.leak_pr} "
-            f"batt_l={self.batt_left_v:.2f}V batt_r={self.batt_right_v:.2f}V "
-            f"state_l={self.state_left} state_r={self.state_right} state_pr={self.state_pr}"
-        )
+        if bms_flag:
+            self.get_logger().warn(f'Node {node_id} BMS flag 0x{bms_flag:02X} {voltage_v:.2f}V {temp_c:.1f}C')
 
-        self.get_logger().info(
-            f"VBD L={self.vbd_left_pos:.2f} R={self.vbd_right_pos:.2f} "
-            f"Pitch={self.pitch_angle:+.1f}deg "
-            f"Batt={self.batt_left_v:.1f}/{self.batt_right_v:.1f}V "
-            f"States=[{self.state_left}][{self.state_right}][{self.state_pr}] "
-            f"{'EMERG' if self.emergency else 'OK'}")
+    def _decode_pr_flags(self, b4, b5):
+        flags = []
+        names_b4 = ['pitch_dir','roll_dir','pitch_homed','roll_homed',
+                     'pitch_moving','roll_moving','pitch_en','roll_en']
+        names_b5 = ['front_lim','rear_lim','leak','hall']
+        for i, n in enumerate(names_b4):
+            if b4 & (1 << i): flags.append(n)
+        for i, n in enumerate(names_b5):
+            if b5 & (1 << i): flags.append(n)
+        return flags
 
-    def pub_float(self, pub, val):
-        msg = Float64(); msg.data = float(val); pub.publish(msg)
+    def _pub_f64(self, pub, val):
+        m = Float64(); m.data = val; pub.publish(m)
 
-    def pub_bool(self, pub, val):
-        msg = Bool();    msg.data = bool(val);  pub.publish(msg)
+    def _pub_bool(self, pub, val):
+        m = Bool(); m.data = val; pub.publish(m)
 
-    def pub_str(self, pub, val):
-        msg = String();  msg.data = str(val);   pub.publish(msg)
+    def _pub_u8(self, pub, val):
+        m = UInt8(); m.data = val; pub.publish(m)
+
+    def destroy_node(self):
+        self._running = False
+        if hasattr(self, 'bus'):
+            self.bus.shutdown()
+        super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = CanBridgeNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
