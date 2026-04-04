@@ -13,6 +13,7 @@
   <depend>sensor_msgs</depend>
   <depend>glider_msgs</depend>
   <depend>action_msgs</depend>
+  <depend>lifecycle_msgs</depend>
 
   <!-- Testing / lint -->
   <test_depend>ament_copyright</test_depend>

@@ -9,7 +9,7 @@ from typing import Optional
 import rclpy
 import rclpy.executors
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.node import Node
+from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn, State
 from std_msgs.msg import String
 import serial
 
@@ -36,12 +36,12 @@ class SbdsxResult:
     msg_waiting: int
 
 
-class IridiumSbdNode(Node):
+class IridiumSbdNode(LifecycleNode):
     def __init__(self):
         super().__init__("communication_iridium_node")
 
         # ----------------------------
-        # Parameters
+        # Parameters (declared here so they're available before configure)
         # ----------------------------
         self.declare_parameter("port", "/dev/ttyAMA2")
         self.declare_parameter("baud", 19200)
@@ -66,28 +66,7 @@ class IridiumSbdNode(Node):
         self.debug = bool(self.get_parameter("debug").value)
 
         # ----------------------------
-        # Publishers
-        # ----------------------------
-        self.status_pub = self.create_publisher(String, "/iridium/status", 10)
-        self.csq_pub = self.create_publisher(String, "/iridium/signal_strength", 10)
-        self.mt_pub = self.create_publisher(String, "/iridium/incoming_message", 10)
-        self.session_result_pub = self.create_publisher(String, "/iridium/session_result", 10)
-        self.mo_status_pub = self.create_publisher(String, "/iridium/mo_status", 10)
-        self.mt_waiting_pub = self.create_publisher(String, "/iridium/mt_waiting", 10)
-
-        # ----------------------------
-        # Subscriber — telemetry payload from telemetry_manager_node
-        # ----------------------------
-        self.sbdwt_sub = self.create_subscription(
-            String,
-            "/iridium/sbdwt",
-            self.sbdwt_callback,
-            10
-        )
-
-        # ----------------------------
-        # Outbound payload state (lock protects access from sbdwt_callback
-        # thread vs action execute thread)
+        # Outbound payload state
         # ----------------------------
         self._lock = threading.Lock()
         self.pending_outbound: Optional[str] = None
@@ -98,30 +77,65 @@ class IridiumSbdNode(Node):
         # Prevent concurrent windows
         self._window_in_progress = False
 
-        # ----------------------------
-        # Serial setup
-        # ----------------------------
-        self.ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=self.serial_timeout,
-            xonxoff=False,
-            rtscts=False,
-            dsrdtr=False,
+        # Resources created in on_configure, destroyed in on_cleanup
+        self.ser: Optional[serial.Serial] = None
+        self._action_server = None
+        self.sbdwt_sub = None
+
+        # Publishers — created in on_configure
+        self.status_pub = None
+        self.csq_pub = None
+        self.mt_pub = None
+        self.session_result_pub = None
+        self.mo_status_pub = None
+        self.mt_waiting_pub = None
+
+        self.get_logger().info("Iridium lifecycle node created (unconfigured)")
+
+    # ------------------------------------------------------------------
+    # Lifecycle callbacks
+    # ------------------------------------------------------------------
+
+    def on_configure(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("Configuring Iridium node...")
+
+        # Publishers
+        self.status_pub = self.create_publisher(String, "/iridium/status", 10)
+        self.csq_pub = self.create_publisher(String, "/iridium/signal_strength", 10)
+        self.mt_pub = self.create_publisher(String, "/iridium/incoming_message", 10)
+        self.session_result_pub = self.create_publisher(String, "/iridium/session_result", 10)
+        self.mo_status_pub = self.create_publisher(String, "/iridium/mo_status", 10)
+        self.mt_waiting_pub = self.create_publisher(String, "/iridium/mt_waiting", 10)
+
+        # Subscriber — telemetry payload from telemetry_manager_node
+        self.sbdwt_sub = self.create_subscription(
+            String,
+            "/iridium/sbdwt",
+            self.sbdwt_callback,
+            10
         )
 
-        self.publish_status(f"Opened {self.port} at {self.baud} baud")
-        self.log_debug(f"Serial connection opened on {self.port}")
+        # Serial port
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.serial_timeout,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+            )
+            self.publish_status(f"Opened {self.port} at {self.baud} baud")
+            self.log_debug(f"Serial connection opened on {self.port}")
+            self.configure_modem()
+        except Exception as e:
+            self.get_logger().error(f"Failed to open serial port {self.port}: {e}")
+            return TransitionCallbackReturn.ERROR
 
-        # Configure modem once at startup
-        self.configure_modem()
-
-        # ----------------------------
         # Action server
-        # ----------------------------
         self._action_server = ActionServer(
             self,
             IridiumWindow,
@@ -131,7 +145,33 @@ class IridiumSbdNode(Node):
             cancel_callback=self.cancel_callback,
         )
 
-        self.get_logger().info("Iridium node ready, waiting for action goals")
+        self.get_logger().info("Iridium node configured, waiting for action goals")
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state: State) -> TransitionCallbackReturn:
+        self.get_logger().info("Cleaning up Iridium node...")
+
+        if self._action_server is not None:
+            self._action_server.destroy()
+            self._action_server = None
+
+        if self.ser is not None and self.ser.is_open:
+            self.ser.close()
+        self.ser = None
+
+        # Reset outbound state so a fresh cycle starts clean
+        with self._lock:
+            self.last_written_outbound = None
+            self.last_successful_outbound = None
+
+        self._window_in_progress = False
+        self.get_logger().info("Iridium node cleaned up (unconfigured)")
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state: State) -> TransitionCallbackReturn:
+        if self.ser is not None and self.ser.is_open:
+            self.ser.close()
+        return TransitionCallbackReturn.SUCCESS
 
     # ------------------------------------------------------------------
     # ROS helpers
@@ -142,7 +182,8 @@ class IridiumSbdNode(Node):
         publisher.publish(msg)
 
     def publish_status(self, text: str):
-        self.publish_string(self.status_pub, text)
+        if self.status_pub is not None:
+            self.publish_string(self.status_pub, text)
         if self.debug:
             self.get_logger().info(text)
 
@@ -164,6 +205,9 @@ class IridiumSbdNode(Node):
     # Action server callbacks
     # ------------------------------------------------------------------
     def goal_callback(self, goal_request):
+        if self.ser is None or not self.ser.is_open:
+            self.get_logger().warn("Rejecting goal: modem not configured")
+            return GoalResponse.REJECT
         if self._window_in_progress:
             self.get_logger().warn("Rejecting goal: comms window already in progress")
             return GoalResponse.REJECT
@@ -510,11 +554,11 @@ class IridiumSbdNode(Node):
     # Cleanup
     # ------------------------------------------------------------------
     def destroy_node(self):
-        try:
-            if self.ser and self.ser.is_open:
+        if self.ser is not None and self.ser.is_open:
+            try:
                 self.ser.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
         super().destroy_node()
 
 

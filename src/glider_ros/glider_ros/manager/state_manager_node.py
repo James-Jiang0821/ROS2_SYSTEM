@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
 from enum import Enum, auto
+from typing import Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
 from std_msgs.msg import String, Bool
+from lifecycle_msgs.srv import ChangeState
+from lifecycle_msgs.msg import Transition
 
 from glider_msgs.action import IridiumWindow
 
@@ -70,6 +73,9 @@ class StateManagerNode(Node):
         self.pending_mission_text = ""
         self.emergency_triggered = False
 
+        # Lifecycle transition future (shared between activate/deactivate calls)
+        self._lc_future = None
+
         # -----------------------------
         # Publishers
         # -----------------------------
@@ -92,6 +98,14 @@ class StateManagerNode(Node):
             self,
             IridiumWindow,
             "/iridium/run_window"
+        )
+
+        # -----------------------------
+        # Iridium lifecycle service client
+        # -----------------------------
+        self._lc_client = self.create_client(
+            ChangeState,
+            "/communication_iridium_node/change_state"
         )
 
         # -----------------------------
@@ -133,25 +147,83 @@ class StateManagerNode(Node):
         self.last_idle_cycle_start_ns = self.get_clock().now().nanoseconds
 
     # =========================================================
-    # Lifecycle placeholders
+    # Lifecycle helpers
     # =========================================================
 
-    def activate_iridium(self) -> bool:
+    def _send_lc_transition(self, transition_id: int):
+        req = ChangeState.Request()
+        req.transition.id = transition_id
+        return self._lc_client.call_async(req)
+
+    def activate_iridium(self) -> Optional[bool]:
         """
-        Placeholder.
-        Later this should call the lifecycle transition to activate
-        communication_iridium_node.
+        Calls the lifecycle 'configure' transition on communication_iridium_node,
+        which opens the serial port and starts the action server.
+
+        Returns:
+            True  — transition completed successfully
+            False — transition failed (or service unavailable)
+            None  — still waiting for the response
         """
-        self.get_logger().info("Activating communication_iridium_node...")
+        if self._lc_future is None:
+            if not self._lc_client.service_is_ready():
+                self.get_logger().warn(
+                    "Iridium lifecycle service not ready; will retry"
+                )
+                return False
+            self.get_logger().info(
+                "Sending lifecycle 'configure' to communication_iridium_node"
+            )
+            self._lc_future = self._send_lc_transition(Transition.TRANSITION_CONFIGURE)
+            return None
+
+        if not self._lc_future.done():
+            return None
+
+        result = self._lc_future.result()
+        self._lc_future = None
+
+        if result is None or not result.success:
+            self.get_logger().warn("Iridium 'configure' transition failed")
+            return False
+
+        self.get_logger().info("Iridium node configured and ready")
         return True
 
-    def deactivate_iridium(self) -> bool:
+    def deactivate_iridium(self) -> Optional[bool]:
         """
-        Placeholder.
-        Later this should call the lifecycle transition to deactivate
-        communication_iridium_node.
+        Calls the lifecycle 'cleanup' transition on communication_iridium_node,
+        which closes the serial port and stops the action server.
+
+        Returns:
+            True  — done (success or non-critical failure, always proceed)
+            None  — still waiting for the response
         """
-        self.get_logger().info("Deactivating communication_iridium_node...")
+        if self._lc_future is None:
+            if not self._lc_client.service_is_ready():
+                self.get_logger().warn(
+                    "Iridium lifecycle service not ready; skipping cleanup"
+                )
+                return True
+            self.get_logger().info(
+                "Sending lifecycle 'cleanup' to communication_iridium_node"
+            )
+            self._lc_future = self._send_lc_transition(Transition.TRANSITION_CLEANUP)
+            return None
+
+        if not self._lc_future.done():
+            return None
+
+        result = self._lc_future.result()
+        self._lc_future = None
+
+        if result is None or not result.success:
+            self.get_logger().warn(
+                "Iridium 'cleanup' transition failed; continuing anyway"
+            )
+        else:
+            self.get_logger().info("Iridium node cleaned up")
+
         return True
 
     # =========================================================
@@ -243,13 +315,15 @@ class StateManagerNode(Node):
                 self.idle_phase = IdlePhase.ACTIVATING_IRIDIUM
 
         elif self.idle_phase == IdlePhase.ACTIVATING_IRIDIUM:
-            ok = self.activate_iridium()
-            if ok:
+            result = self.activate_iridium()
+            if result is True:
                 self.idle_phase = IdlePhase.SENDING_WINDOW_GOAL
-            else:
+            elif result is False:
                 self.get_logger().warn("Failed to activate Iridium; staying in IDLE")
+                self._lc_future = None
                 self.reset_idle_timer()
                 self.idle_phase = IdlePhase.WAITING_FOR_TIMER
+            # None = still waiting, stay in this phase
 
         elif self.idle_phase == IdlePhase.SENDING_WINDOW_GOAL:
             self.send_iridium_window_goal()
@@ -259,9 +333,11 @@ class StateManagerNode(Node):
             pass
 
         elif self.idle_phase == IdlePhase.DEACTIVATING_IRIDIUM:
-            self.deactivate_iridium()
-            self.reset_idle_timer()
-            self.idle_phase = IdlePhase.WAITING_FOR_TIMER
+            result = self.deactivate_iridium()
+            if result is True:
+                self.reset_idle_timer()
+                self.idle_phase = IdlePhase.WAITING_FOR_TIMER
+            # None = still waiting, stay in this phase
 
     def handle_initialise(self):
         # We will fill this in next
