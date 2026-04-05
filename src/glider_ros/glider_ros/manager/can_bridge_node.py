@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
+"""
+can_bridge_node.py
 
+Bidirectional bridge between CAN bus (3x Teensy 4.0) and ROS 2 topics.
+Matches Jasper's CAN protocol specs exactly:
+  - P_R_TEENSY (Node ID 3)
+  - VBD_TEENSY (Node ID 1 = Left, Node ID 2 = Right)
+
+Key differences between P&R and VBD:
+  CMD:    P&R sends int16 pitch(0.1mm) + int16 roll(0.1deg)
+          VBD sends uint8 stroke percentage (0-100)
+  STATUS: P&R byte 4-5 = different flag layout than VBD byte 4
+          VBD leak = byte4 bit1, P&R leak = byte5 bit2
+          VBD pos/tof = uint16 little-endian, P&R = int16 (endianness TBC)
+  FAULT:  Completely different bit names per node type
+"""
 
 import struct
 import threading
@@ -45,6 +60,9 @@ class CanBridgeNode(Node):
         self._setup_vbd_interface('left', VBD_L)
         self._setup_vbd_interface('right', VBD_R)
 
+        # Iridium test subscription
+        self.create_subscription(String, '/iridium/incoming', self._cb_iridium, 10)
+
         self._running = True
         self._rx_thread = threading.Thread(target=self._can_rx_loop, daemon=True)
         self._rx_thread.start()
@@ -54,7 +72,9 @@ class CanBridgeNode(Node):
 
         self.get_logger().info('CAN bridge running')
 
-    # ── Interface setup ──
+    # ══════════════════════════════════════════════
+    # Interface setup
+    # ══════════════════════════════════════════════
 
     def _setup_pr_interface(self):
         self.pr_pitch_mm = 0.0
@@ -81,13 +101,13 @@ class CanBridgeNode(Node):
         self.pub_pr_bms_flag = self.create_publisher(UInt8, '/feedback/pr/bms_flag', 10)
 
     def _setup_vbd_interface(self, side, node_id):
-        setattr(self, f'vbd_{side}_mm', 0.0)
+        setattr(self, f'vbd_{side}_pct', 0)
         setattr(self, f'vbd_{side}_enable', False)
         setattr(self, f'vbd_{side}_home', False)
 
         self.create_subscription(
-            Float64, f'/cmd/vbd_{side}_mm',
-            lambda msg, s=side: setattr(self, f'vbd_{s}_mm', msg.data), 10)
+            UInt8, f'/cmd/vbd_{side}_pct',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_pct', msg.data), 10)
         self.create_subscription(
             Bool, f'/cmd/vbd_{side}_enable',
             lambda msg, s=side: setattr(self, f'vbd_{s}_enable', msg.data), 10)
@@ -95,13 +115,16 @@ class CanBridgeNode(Node):
             Bool, f'/cmd/vbd_{side}_home',
             lambda msg, s=side: setattr(self, f'vbd_{s}_home', msg.data), 10)
 
-        for name, typ in [('pos_mm', Float64), ('leak', Bool), ('seq', UInt8),
-                          ('fault', String), ('bms_voltage_v', Float64),
-                          ('bms_temp_c', Float64), ('bms_flag', UInt8)]:
+        for name, typ in [('pos_mm', Float64), ('tof_mm', Float64), ('leak', Bool),
+                          ('homed', Bool), ('seq', UInt8), ('fault', String),
+                          ('bms_voltage_v', Float64), ('bms_temp_c', Float64),
+                          ('bms_flag', UInt8)]:
             setattr(self, f'pub_vbd_{side}_{name}',
                 self.create_publisher(typ, f'/feedback/vbd_{side}/{name}', 10))
 
-    # ── Command callbacks ──
+    # ══════════════════════════════════════════════
+    # Command callbacks
+    # ══════════════════════════════════════════════
 
     def _cb_pr_pitch(self, msg):
         self.pr_pitch_mm = max(-56.9, min(56.9, msg.data))
@@ -115,7 +138,14 @@ class CanBridgeNode(Node):
     def _cb_pr_home(self, msg):
         self.pr_home = msg.data
 
-    # ── Outgoing: ROS topics -> CAN frames ──
+    def _cb_iridium(self, msg):
+        self.get_logger().info(f'Iridium: {msg.data}')
+        self.pr_enable = True
+        self.pr_pitch_mm = 10.0
+
+    # ══════════════════════════════════════════════
+    # Outgoing: ROS topics -> CAN frames
+    # ══════════════════════════════════════════════
 
     def _republish_commands(self):
         self._send_pr_cmd()
@@ -123,6 +153,13 @@ class CanBridgeNode(Node):
         self._send_vbd_cmd(VBD_R, 'right')
 
     def _send_pr_cmd(self):
+        # P&R CMD_SETPOINT (0x103):
+        #   Byte 0-1: pitch_setpoint (int16, 0.1mm)
+        #   Byte 2-3: roll_setpoint (int16, 0.1deg)
+        #   Byte 4:   command mode (bit0=ENABLE, bit1=HOME)
+        #   Byte 5:   reserve
+        #   Byte 6:   sequence counter
+        #   Byte 7:   reserve
         pitch_raw = int(round(self.pr_pitch_mm * 10))
         roll_raw = int(round(self.pr_roll_deg * 10))
         cmd_bits = (0x01 if self.pr_enable else 0) | (0x02 if self.pr_home else 0)
@@ -132,17 +169,25 @@ class CanBridgeNode(Node):
         self._tx(CMD_BASE + PR, data)
 
     def _send_vbd_cmd(self, node_id, side):
-        pos_mm = getattr(self, f'vbd_{side}_mm')
+        # VBD CMD_SETPOINT (0x101 or 0x102):
+        #   Byte 0:   stroke percentage (uint8, 0-100)
+        #   Byte 1:   reserve
+        #   Byte 2:   reserve
+        #   Byte 3:   command mode (bit0=ENABLE, bit1=HOMING)
+        #   Byte 4:   reserve
+        #   Byte 5:   reserve
+        #   Byte 6:   sequence counter
+        #   Byte 7:   reserve
+        pct = max(0, min(100, getattr(self, f'vbd_{side}_pct')))
         enable = getattr(self, f'vbd_{side}_enable')
         home = getattr(self, f'vbd_{side}_home')
-        pos_raw = int(round(pos_mm * 10))
         cmd_bits = (0x01 if enable else 0) | (0x02 if home else 0)
 
         attr = f'seq_vbd_{"l" if node_id == VBD_L else "r"}'
         seq = (getattr(self, attr) + 1) & 0xFF
         setattr(self, attr, seq)
 
-        data = struct.pack('>hxxBxBx', pos_raw, cmd_bits, seq)
+        data = bytes([pct, 0x00, 0x00, cmd_bits, 0x00, 0x00, seq, 0x00])
         self._tx(CMD_BASE + node_id, data)
 
     def _tx(self, can_id, data):
@@ -152,7 +197,9 @@ class CanBridgeNode(Node):
         except Exception as e:
             self.get_logger().warn(f'CAN TX 0x{can_id:03X} failed: {e}')
 
-    # ── Incoming: CAN frames -> ROS topics ──
+    # ══════════════════════════════════════════════
+    # Incoming: CAN frames -> ROS topics
+    # ══════════════════════════════════════════════
 
     def _can_rx_loop(self):
         while self._running:
@@ -170,59 +217,139 @@ class CanBridgeNode(Node):
                     handler(node_id, d)
                     break
 
+    # ── STATUS_CONTROL parsing ──
+
     def _parse_status(self, node_id, d):
         if len(d) < 8:
             return
 
         if node_id == PR:
-            pitch_raw, roll_raw = struct.unpack_from('>hh', d, 0)
-            b4, b5, seq = d[4], d[5], d[6]
-            tof = struct.unpack_from('>b', d, 7)[0]
-
-            self._pub_f64(self.pub_pr_pitch_pos, pitch_raw / 10.0)
-            self._pub_f64(self.pub_pr_roll_pos, roll_raw / 10.0)
-            self._pub_f64(self.pub_pr_tof, float(tof))
-            self._pub_bool(self.pub_pr_leak, bool(b5 & 0x04))
-            self._pub_bool(self.pub_pr_pitch_homed, bool(b4 & 0x04))
-            self._pub_bool(self.pub_pr_roll_homed, bool(b4 & 0x08))
-            self._pub_u8(self.pub_pr_seq, seq)
-
-            flags = self._decode_pr_flags(b4, b5)
-            s = String(); s.data = ','.join(flags) if flags else 'none'
-            self.pub_pr_status.publish(s)
-
+            self._parse_pr_status(d)
         elif node_id in (VBD_L, VBD_R):
-            side = 'left' if node_id == VBD_L else 'right'
-            pos_raw = struct.unpack_from('>h', d, 0)[0]
-            b5, seq = d[5], d[6]
-            leak = bool(b5 & 0x04)
+            self._parse_vbd_status(node_id, d)
 
-            self._pub_f64(getattr(self, f'pub_vbd_{side}_pos_mm'), pos_raw / 10.0)
-            self._pub_bool(getattr(self, f'pub_vbd_{side}_leak'), leak)
-            self._pub_u8(getattr(self, f'pub_vbd_{side}_seq'), seq)
+    def _parse_pr_status(self, d):
+        # P&R STATUS_CONTROL (0x203):
+        #   Byte 0-1: pitch_pos (int16, 0.1mm)
+        #   Byte 2-3: roll_pos (int16, 0.1deg)
+        #   Byte 4:   flags (pitch_dir, roll_dir, pitch_homed, roll_homed,
+        #              pitch_moving, roll_moving, pitch_en, roll_en)
+        #   Byte 5:   flags (front_lim, rear_lim, leak, hall, -, -, -, -)
+        #   Byte 6:   sequence counter
+        #   Byte 7:   tof (int8, 1mm)
+        pitch_raw, roll_raw = struct.unpack_from('>hh', d, 0)
+        b4, b5, seq = d[4], d[5], d[6]
+        tof = struct.unpack_from('>b', d, 7)[0]
+
+        self._pub_f64(self.pub_pr_pitch_pos, pitch_raw / 10.0)
+        self._pub_f64(self.pub_pr_roll_pos, roll_raw / 10.0)
+        self._pub_f64(self.pub_pr_tof, float(tof))
+
+        # P&R: leak is byte 5, bit 2
+        self._pub_bool(self.pub_pr_leak, bool(b5 & 0x04))
+        # P&R: pitch_homed is byte 4 bit 2, roll_homed is byte 4 bit 3
+        self._pub_bool(self.pub_pr_pitch_homed, bool(b4 & 0x04))
+        self._pub_bool(self.pub_pr_roll_homed, bool(b4 & 0x08))
+        self._pub_u8(self.pub_pr_seq, seq)
+
+        flags = []
+        pr_flag_names_b4 = ['pitch_dir','roll_dir','pitch_homed','roll_homed',
+                            'pitch_moving','roll_moving','pitch_en','roll_en']
+        pr_flag_names_b5 = ['front_lim','rear_lim','leak','hall']
+        for i, n in enumerate(pr_flag_names_b4):
+            if b4 & (1 << i): flags.append(n)
+        for i, n in enumerate(pr_flag_names_b5):
+            if b5 & (1 << i): flags.append(n)
+        s = String(); s.data = ','.join(flags) if flags else 'none'
+        self.pub_pr_status.publish(s)
+
+    def _parse_vbd_status(self, node_id, d):
+        # VBD STATUS_CONTROL (0x201 or 0x202):
+        #   Byte 0-1: pos_mm (uint16, LITTLE-ENDIAN)
+        #   Byte 2-3: tof_mm (uint16, LITTLE-ENDIAN)
+        #   Byte 4:   flags (prox, leak, driver_flt, homed, moving, motor_enabled, dir, -)
+        #   Byte 5:   pwm (uint8)
+        #   Byte 6:   sequence counter
+        #   Byte 7:   current sense (uint8)
+        side = 'left' if node_id == VBD_L else 'right'
+
+        pos_raw = struct.unpack_from('<H', d, 0)[0]
+        tof_raw = struct.unpack_from('<H', d, 2)[0]
+        b4 = d[4]
+        seq = d[6]
+
+        # VBD pos is 0-1500 representing 0-150.0mm
+        self._pub_f64(getattr(self, f'pub_vbd_{side}_pos_mm'), pos_raw / 10.0)
+        self._pub_f64(getattr(self, f'pub_vbd_{side}_tof_mm'), tof_raw / 10.0)
+
+        # VBD: leak is byte 4, bit 1
+        leak = bool(b4 & 0x02)
+        self._pub_bool(getattr(self, f'pub_vbd_{side}_leak'), leak)
+
+        # VBD: homed is byte 4, bit 3
+        homed = bool(b4 & 0x08)
+        self._pub_bool(getattr(self, f'pub_vbd_{side}_homed'), homed)
+
+        self._pub_u8(getattr(self, f'pub_vbd_{side}_seq'), seq)
+
+    # ── STATUS_FAULT parsing ──
 
     def _parse_fault(self, node_id, d):
         if len(d) < 8:
             return
 
-        hard_names_b0 = ['LEAK','DRIVER_PITCH','DRIVER_ROLL','CMD_TO_L',
-                         'PITCH_N_HOME','ROLL_N_HOME','BMS_TEMP','BMS_TO_L']
-        hard_names_b1 = ['BMS_OC','BMS_SWITCH','STALL_PITCH','STALL_ROLL']
-        soft_names_b2 = ['CMD_TO','TOF_INV','BMS_TO','BMS_LOW','BMS_HIGH']
+        if node_id == PR:
+            self._parse_pr_fault(d)
+        elif node_id in (VBD_L, VBD_R):
+            self._parse_vbd_fault(node_id, d)
 
-        hards = [n for i, n in enumerate(hard_names_b0) if d[0] & (1 << i)]
-        hards += [n for i, n in enumerate(hard_names_b1) if d[1] & (1 << i)]
-        softs = [n for i, n in enumerate(soft_names_b2) if d[2] & (1 << i)]
+    def _parse_pr_fault(self, d):
+        # P&R FAULT (0x053):
+        #   Byte 0: LEAK, DRIVER_PITCH, DRIVER_ROLL, CMD_TO_L,
+        #           PITCH_N_HOME, ROLL_N_HOME, BMS_TEMP, BMS_TO_L
+        #   Byte 1: BMS_OC, BMS_SWITCH, STALL_PITCH, STALL_ROLL
+        #   Byte 2: CMD_TO, TOF_INV, BMS_TO, BMS_LOW, BMS_HIGH
+        pr_hard_b0 = ['LEAK','DRIVER_PITCH','DRIVER_ROLL','CMD_TO_L',
+                      'PITCH_N_HOME','ROLL_N_HOME','BMS_TEMP','BMS_TO_L']
+        pr_hard_b1 = ['BMS_OC','BMS_SWITCH','STALL_PITCH','STALL_ROLL']
+        pr_soft_b2 = ['CMD_TO','TOF_INV','BMS_TO','BMS_LOW','BMS_HIGH']
+
+        hards = [n for i, n in enumerate(pr_hard_b0) if d[0] & (1 << i)]
+        hards += [n for i, n in enumerate(pr_hard_b1) if d[1] & (1 << i)]
+        softs = [n for i, n in enumerate(pr_soft_b2) if d[2] & (1 << i)]
+
         state = d[5]
         state_names = ['UNHOMED','HOMING','RUN','HOLD','FAULT']
         state_str = state_names[state] if state < len(state_names) else f'UNK({state})'
 
-        if node_id == PR:
-            pub = self.pub_pr_fault
-        else:
-            side = 'left' if node_id == VBD_L else 'right'
-            pub = getattr(self, f'pub_vbd_{side}_fault')
+        self._publish_fault_msg(self.pub_pr_fault, hards, softs, state_str, PR)
 
+    def _parse_vbd_fault(self, node_id, d):
+        # VBD FAULT (0x051 or 0x052):
+        #   Byte 0: LEAK, DRIVER_FLT, OVERCURRENT, STALL,
+        #           CMD_TO_L, NOT_HOMED, POS_LIM, BMS_TEMP
+        #   Byte 1: BMS_TO_L, BMS_OC, BMS_SWITCH
+        #   Byte 2: CMD_TO, TOF_INV, TOF_OOR, SLIP,
+        #           ENCODER_INV, BMS_TO, BMS_LOW, BMS_HIGH
+        vbd_hard_b0 = ['LEAK','DRIVER_FLT','OVERCURRENT','STALL',
+                       'CMD_TO_L','NOT_HOMED','POS_LIM','BMS_TEMP']
+        vbd_hard_b1 = ['BMS_TO_L','BMS_OC','BMS_SWITCH']
+        vbd_soft_b2 = ['CMD_TO','TOF_INV','TOF_OOR','SLIP',
+                       'ENCODER_INV','BMS_TO','BMS_LOW','BMS_HIGH']
+
+        hards = [n for i, n in enumerate(vbd_hard_b0) if d[0] & (1 << i)]
+        hards += [n for i, n in enumerate(vbd_hard_b1) if d[1] & (1 << i)]
+        softs = [n for i, n in enumerate(vbd_soft_b2) if d[2] & (1 << i)]
+
+        state = d[5]
+        state_names = ['UNHOMED','HOMING','RUN','HOLD','FAULT']
+        state_str = state_names[state] if state < len(state_names) else f'UNK({state})'
+
+        side = 'left' if node_id == VBD_L else 'right'
+        pub = getattr(self, f'pub_vbd_{side}_fault')
+        self._publish_fault_msg(pub, hards, softs, state_str, node_id)
+
+    def _publish_fault_msg(self, pub, hards, softs, state_str, node_id):
         if hards:
             s = String(); s.data = f'HARD:{",".join(hards)}|state:{state_str}'
             pub.publish(s)
@@ -235,7 +362,14 @@ class CanBridgeNode(Node):
             s = String(); s.data = f'OK|state:{state_str}'
             pub.publish(s)
 
+    # ── STATUS_BMS parsing (same format for both P&R and VBD) ──
+
     def _parse_bms(self, node_id, d):
+        # BMS (0x211, 0x212, 0x213):
+        #   Byte 0-1: pack_mV (uint16)
+        #   Byte 2-3: pack_temp (int16)
+        #   Byte 4:   bms flag (uint8)
+        #   Byte 6:   sequence counter
         if len(d) < 7:
             return
 
@@ -259,16 +393,9 @@ class CanBridgeNode(Node):
         if bms_flag:
             self.get_logger().warn(f'Node {node_id} BMS flag 0x{bms_flag:02X} {voltage_v:.2f}V {temp_c:.1f}C')
 
-    def _decode_pr_flags(self, b4, b5):
-        flags = []
-        names_b4 = ['pitch_dir','roll_dir','pitch_homed','roll_homed',
-                     'pitch_moving','roll_moving','pitch_en','roll_en']
-        names_b5 = ['front_lim','rear_lim','leak','hall']
-        for i, n in enumerate(names_b4):
-            if b4 & (1 << i): flags.append(n)
-        for i, n in enumerate(names_b5):
-            if b5 & (1 << i): flags.append(n)
-        return flags
+    # ══════════════════════════════════════════════
+    # Publish helpers
+    # ══════════════════════════════════════════════
 
     def _pub_f64(self, pub, val):
         m = Float64(); m.data = val; pub.publish(m)
