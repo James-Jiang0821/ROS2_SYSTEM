@@ -150,10 +150,10 @@ class GliderController(LifecycleNode):
         self._sub_force_surface = self.create_subscription(
             Bool, '/controller/force_surface', self._cb_force_surface, 10)
 
-        self.pub_pitch_mm = self.create_publisher(Float64, '/cmd/pitch_mm', 10)
-        self.pub_roll_deg = self.create_publisher(Float64, '/cmd/roll_deg', 10)
-        self.pub_vbd_left = self.create_publisher(UInt8, '/cmd/vbd_left_pct', 10)
-        self.pub_vbd_right = self.create_publisher(UInt8, '/cmd/vbd_right_pct', 10)
+        self.pub_pitch_mm = self.create_publisher(Float64, '/controller/pitch_mm', 10)
+        self.pub_roll_deg = self.create_publisher(Float64, '/controller/roll_deg', 10)
+        self.pub_vbd_left = self.create_publisher(UInt8, '/controller/vbd_left_pct', 10)
+        self.pub_vbd_right = self.create_publisher(UInt8, '/controller/vbd_right_pct', 10)
         self.pub_phase = self.create_publisher(String, '/controller/phase', 10)
 
         self.get_logger().info('Controller configured')

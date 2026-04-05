@@ -101,23 +101,23 @@ class CanBridgeNode(Node):
         self.pr_enable = False
         self.pr_home = False
 
-        self.create_subscription(Float64, '/cmd/pitch_mm', self._cb_pr_pitch, 10)
-        self.create_subscription(Float64, '/cmd/roll_deg', self._cb_pr_roll, 10)
-        self.create_subscription(Bool, '/cmd/pr_enable', self._cb_pr_enable, 10)
-        self.create_subscription(Bool, '/cmd/pr_home', self._cb_pr_home, 10)
+        self.create_subscription(Float64, '/controller/pitch_mm', self._cb_pr_pitch, 10)
+        self.create_subscription(Float64, '/controller/roll_deg', self._cb_pr_roll, 10)
+        self.create_subscription(Bool, '/controller/pr_enable', self._cb_pr_enable, 10)
+        self.create_subscription(Bool, '/controller/pr_home', self._cb_pr_home, 10)
 
-        self.pub_pr_pitch_pos = self.create_publisher(Float64, '/feedback/pr/pitch_pos_mm', 10)
-        self.pub_pr_roll_pos = self.create_publisher(Float64, '/feedback/pr/roll_pos_deg', 10)
-        self.pub_pr_tof = self.create_publisher(Float64, '/feedback/pr/tof_mm', 10)
-        self.pub_pr_leak = self.create_publisher(Bool, '/feedback/pr/leak', 10)
-        self.pub_pr_pitch_homed = self.create_publisher(Bool, '/feedback/pr/pitch_homed', 10)
-        self.pub_pr_roll_homed = self.create_publisher(Bool, '/feedback/pr/roll_homed', 10)
-        self.pub_pr_status = self.create_publisher(String, '/feedback/pr/status_flags', 10)
-        self.pub_pr_seq = self.create_publisher(UInt8, '/feedback/pr/seq', 10)
-        self.pub_pr_fault = self.create_publisher(String, '/feedback/pr/fault', 10)
-        self.pub_pr_bms_v = self.create_publisher(Float64, '/feedback/pr/bms_voltage_v', 10)
-        self.pub_pr_bms_t = self.create_publisher(Float64, '/feedback/pr/bms_temp_c', 10)
-        self.pub_pr_bms_flag = self.create_publisher(UInt8, '/feedback/pr/bms_flag', 10)
+        self.pub_pr_pitch_pos = self.create_publisher(Float64, '/bridge/pr/pitch_pos_mm', 10)
+        self.pub_pr_roll_pos = self.create_publisher(Float64, '/bridge/pr/roll_pos_deg', 10)
+        self.pub_pr_tof = self.create_publisher(Float64, '/bridge/pr/tof_mm', 10)
+        self.pub_pr_leak = self.create_publisher(Bool, '/bridge/pr/leak', 10)
+        self.pub_pr_pitch_homed = self.create_publisher(Bool, '/bridge/pr/pitch_homed', 10)
+        self.pub_pr_roll_homed = self.create_publisher(Bool, '/bridge/pr/roll_homed', 10)
+        self.pub_pr_status = self.create_publisher(String, '/bridge/pr/status_flags', 10)
+        self.pub_pr_seq = self.create_publisher(UInt8, '/bridge/pr/seq', 10)
+        self.pub_pr_fault = self.create_publisher(String, '/bridge/pr/fault', 10)
+        self.pub_pr_bms_v = self.create_publisher(Float64, '/bridge/pr/bms_voltage_v', 10)
+        self.pub_pr_bms_t = self.create_publisher(Float64, '/bridge/pr/bms_temp_c', 10)
+        self.pub_pr_bms_flag = self.create_publisher(UInt8, '/bridge/pr/bms_flag', 10)
 
     def _setup_vbd_interface(self, side, node_id):
         setattr(self, f'vbd_{side}_pct', 0)
@@ -125,13 +125,13 @@ class CanBridgeNode(Node):
         setattr(self, f'vbd_{side}_home', False)
 
         self.create_subscription(
-            UInt8, f'/cmd/vbd_{side}_pct',
+            UInt8, f'/controller/vbd_{side}_pct',
             lambda msg, s=side: setattr(self, f'vbd_{s}_pct', msg.data), 10)
         self.create_subscription(
-            Bool, f'/cmd/vbd_{side}_enable',
+            Bool, f'/controller/vbd_{side}_enable',
             lambda msg, s=side: setattr(self, f'vbd_{s}_enable', msg.data), 10)
         self.create_subscription(
-            Bool, f'/cmd/vbd_{side}_home',
+            Bool, f'/controller/vbd_{side}_home',
             lambda msg, s=side: setattr(self, f'vbd_{s}_home', msg.data), 10)
 
         for name, typ in [('pos_mm', Float64), ('tof_mm', Float64), ('leak', Bool),
@@ -139,7 +139,7 @@ class CanBridgeNode(Node):
                           ('bms_voltage_v', Float64), ('bms_temp_c', Float64),
                           ('bms_flag', UInt8)]:
             setattr(self, f'pub_vbd_{side}_{name}',
-                self.create_publisher(typ, f'/feedback/vbd_{side}/{name}', 10))
+                self.create_publisher(typ, f'/bridge/vbd_{side}/{name}', 10))
 
     # ══════════════════════════════════════════════
     # Command callbacks
