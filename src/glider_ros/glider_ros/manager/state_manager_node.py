@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
-from std_msgs.msg import String, Bool
+from std_msgs.msg import Bool, Float64, String
 from lifecycle_msgs.srv import ChangeState
 from lifecycle_msgs.msg import Transition
 from rcl_interfaces.srv import SetParameters
@@ -45,6 +45,14 @@ class OperationPhase(Enum):
     CLEANING_UP_CONTROLLER = auto()
 
 
+class EmergencyPhase(Enum):
+    CHECKING_DEPTH = auto()          # decide: underwater or surface?
+    SURFACING = auto()               # force controller to climb, wait for COMPLETE
+    DEACTIVATING_CONTROLLER = auto() # stop the controller lifecycle node
+    CLEANING_UP_CONTROLLER = auto()  # cleanup the controller lifecycle node
+    SAFE = auto()                    # on surface, controller off — holding here
+
+
 class StateManagerNode(Node):
     def __init__(self):
         super().__init__("state_manager_node")
@@ -60,6 +68,7 @@ class StateManagerNode(Node):
         self.idle_phase = IdlePhase.WAITING_FOR_TIMER
         self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
         self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
+        self.emergency_phase = EmergencyPhase.CHECKING_DEPTH
 
         # -----------------------------
         # Parameters
@@ -67,6 +76,7 @@ class StateManagerNode(Node):
         self.declare_parameter("idle_iridium_period_s", 300.0)   # 5 min
         self.declare_parameter("iridium_settling_time_s", 60.0)
         self.declare_parameter("iridium_max_attempts", 3)
+        self.declare_parameter("surface_depth_m", 1.0)          # depth below which we consider glider submerged
 
         self.idle_iridium_period_s = float(
             self.get_parameter("idle_iridium_period_s").value)
@@ -74,6 +84,8 @@ class StateManagerNode(Node):
             self.get_parameter("iridium_settling_time_s").value)
         self.iridium_max_attempts = int(
             self.get_parameter("iridium_max_attempts").value)
+        self.surface_depth_m = float(
+            self.get_parameter("surface_depth_m").value)
 
         # -----------------------------
         # Track timing
@@ -89,6 +101,8 @@ class StateManagerNode(Node):
         self.emergency_triggered = False
         self.home_goal_in_flight = False
         self.controller_complete = False
+        self._controller_active = False  # True only while in OPERATION RUNNING phase
+        self._current_depth = 0.0        # latest reading from /pressure/depth
 
         # Async futures
         self._iridium_lc_future = None   # Iridium lifecycle transitions
@@ -99,12 +113,15 @@ class StateManagerNode(Node):
         # Publishers
         # -----------------------------
         self.state_pub = self.create_publisher(String, "/manager/state", 10)
+        self._force_surface_pub = self.create_publisher(
+            Bool, "/controller/force_surface", 10)
 
         # -----------------------------
         # Subscriptions
         # -----------------------------
         self.create_subscription(Bool, "/safety/emergency", self.emergency_cb, 10)
         self.create_subscription(String, "/controller/phase", self._controller_phase_cb, 10)
+        self.create_subscription(Float64, "/pressure/depth", self._depth_cb, 10)
 
         # -----------------------------
         # Action clients
@@ -140,6 +157,9 @@ class StateManagerNode(Node):
     def emergency_cb(self, msg: Bool):
         if msg.data:
             self.emergency_triggered = True
+
+    def _depth_cb(self, msg: Float64):
+        self._current_depth = msg.data
 
     def _controller_phase_cb(self, msg: String):
         if msg.data == 'COMPLETE' and not self.controller_complete:
@@ -509,6 +529,7 @@ class StateManagerNode(Node):
             result = self.activate_controller()
             if result is True:
                 self.controller_complete = False
+                self._controller_active = True
                 self.operation_phase = OperationPhase.RUNNING
             elif result is False:
                 self.get_logger().error("Failed to activate controller; going to EMERGENCY")
@@ -529,14 +550,53 @@ class StateManagerNode(Node):
             if result is True:
                 self.pending_mission_text = ""
                 self.controller_complete = False
+                self._controller_active = False
                 self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
                 self.reset_idle_timer()
                 self.idle_phase = IdlePhase.WAITING_FOR_TIMER
                 self.transition_to(MissionState.IDLE)
 
     def handle_emergency(self):
-        # Placeholder — safe-state commands will go here
-        pass
+        if self.emergency_phase == EmergencyPhase.CHECKING_DEPTH:
+            underwater = self._current_depth > self.surface_depth_m
+            if underwater:
+                self.get_logger().error(
+                    f"EMERGENCY: glider is underwater ({self._current_depth:.2f}m) — forcing surface")
+                self.emergency_phase = EmergencyPhase.SURFACING
+            else:
+                self.get_logger().error(
+                    f"EMERGENCY: glider is on surface ({self._current_depth:.2f}m) — "
+                    + ("deactivating controller" if self._controller_active else "safe"))
+                if self._controller_active:
+                    self.emergency_phase = EmergencyPhase.DEACTIVATING_CONTROLLER
+                else:
+                    self.emergency_phase = EmergencyPhase.SAFE
+
+        elif self.emergency_phase == EmergencyPhase.SURFACING:
+            # Keep publishing force_surface until controller reports COMPLETE
+            msg = Bool()
+            msg.data = True
+            self._force_surface_pub.publish(msg)
+
+            if self.controller_complete:
+                self.get_logger().error("EMERGENCY: glider has surfaced — deactivating controller")
+                self.controller_complete = False
+                self.emergency_phase = EmergencyPhase.DEACTIVATING_CONTROLLER
+
+        elif self.emergency_phase == EmergencyPhase.DEACTIVATING_CONTROLLER:
+            result = self.deactivate_controller()
+            if result is True:
+                self.emergency_phase = EmergencyPhase.CLEANING_UP_CONTROLLER
+
+        elif self.emergency_phase == EmergencyPhase.CLEANING_UP_CONTROLLER:
+            result = self.cleanup_controller()
+            if result is True:
+                self._controller_active = False
+                self.emergency_phase = EmergencyPhase.SAFE
+                self.get_logger().error("EMERGENCY: controller off — holding at surface")
+
+        elif self.emergency_phase == EmergencyPhase.SAFE:
+            pass  # holding — no exit from emergency yet
 
     # =========================================================
     # Main loop
@@ -548,6 +608,7 @@ class StateManagerNode(Node):
         # Global emergency override
         if self.emergency_triggered and self.state != MissionState.EMERGENCY:
             self.get_logger().error("Emergency triggered")
+            self.emergency_phase = EmergencyPhase.CHECKING_DEPTH
             self.transition_to(MissionState.EMERGENCY)
 
         if self.state == MissionState.IDLE:

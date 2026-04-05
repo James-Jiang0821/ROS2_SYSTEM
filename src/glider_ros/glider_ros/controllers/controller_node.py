@@ -25,7 +25,7 @@ Gains from Ibrahim's glider_params.m:
 import math
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
-from std_msgs.msg import Float64, String, UInt8
+from std_msgs.msg import Bool, Float64, String, UInt8
 from sensor_msgs.msg import Imu
 
 
@@ -108,6 +108,7 @@ class GliderController(LifecycleNode):
         self.vbd_raw_pct = 0
 
         # Created in on_configure
+        self._sub_force_surface = None
         self.pi_theta = None
         self.pi_q = None
         self.filt_alpha = None
@@ -146,6 +147,8 @@ class GliderController(LifecycleNode):
             Imu, '/imu/data', self._cb_imu, 10)
         self._sub_depth = self.create_subscription(
             Float64, '/pressure/depth', self._cb_depth, 10)
+        self._sub_force_surface = self.create_subscription(
+            Bool, '/controller/force_surface', self._cb_force_surface, 10)
 
         self.pub_pitch_mm = self.create_publisher(Float64, '/cmd/pitch_mm', 10)
         self.pub_roll_deg = self.create_publisher(Float64, '/cmd/roll_deg', 10)
@@ -199,6 +202,9 @@ class GliderController(LifecycleNode):
         if self._sub_depth:
             self.destroy_subscription(self._sub_depth)
             self._sub_depth = None
+        if self._sub_force_surface:
+            self.destroy_subscription(self._sub_force_surface)
+            self._sub_force_surface = None
         for attr in ('pub_pitch_mm', 'pub_roll_deg', 'pub_vbd_left',
                      'pub_vbd_right', 'pub_phase'):
             pub = getattr(self, attr, None)
@@ -249,6 +255,12 @@ class GliderController(LifecycleNode):
 
     def _cb_depth(self, msg):
         self.depth = msg.data
+
+    def _cb_force_surface(self, msg: Bool):
+        if msg.data and self.operating:
+            self.diving = False
+            self.operating = True  # keep running so supervisor can publish COMPLETE
+            self.get_logger().warn('EMERGENCY: forced to climb — surfacing')
 
     # ── Mission supervisor ──────────────────────────────────────────────────
 
