@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-glider_controller.py
+controller_node.py
 
-Pure control logic node. Does one thing: run Ibrahim's nested PI
-controller when told to operate, stop when told to stop.
+Glider nested PI controller as a lifecycle node. Activated only during
+OPERATION state by the state manager.
 
-Subscribes to /mission/command:
-  "OPERATION" → start running PI loops
-  Anything else → stop, publish nothing
+Lifecycle:
+  configure  → create subscribers, publishers, PI objects
+  activate   → reload params (picks up mission depth), reset state, start timer
+  deactivate → stop timer
+  cleanup    → destroy subscribers, publishers
 
-Inside OPERATION, Ibrahim's mission supervisor handles dive/climb
-switching internally based on depth. When max_dives reached,
-publishes "COMPLETE" on /controller/phase and stops.
-
-All homing, safety, emergency handling is done by other nodes.
-This node only does control maths.
+On activate the node immediately begins diving. When depth_lower is
+reached it climbs back to depth_upper, then publishes COMPLETE on
+/controller/phase and stops. The state manager sees COMPLETE and
+deactivates the node.
 
 Gains from Ibrahim's glider_params.m:
   Outer PI: Kp=1.5, Ki=0.002 (Ti=750s)
@@ -24,8 +24,8 @@ Gains from Ibrahim's glider_params.m:
 
 import math
 import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64, Bool, String, UInt8
+from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
+from std_msgs.msg import Float64, String, UInt8
 from sensor_msgs.msg import Imu
 
 
@@ -44,10 +44,8 @@ class PIController:
         p_term = self.kp * error
         proposed = p_term + self.ki * (self.integral + error * dt)
         output = max(self.out_min, min(self.out_max, proposed))
-        if (proposed > self.out_max and error > 0) or \
-           (proposed < self.out_min and error < 0):
-            pass
-        else:
+        if not ((proposed > self.out_max and error > 0) or
+                (proposed < self.out_min and error < 0)):
             self.integral += error * dt
         return output
 
@@ -68,11 +66,12 @@ class FirstOrderFilter:
         self.y = value
 
 
-class GliderController(Node):
+class GliderController(LifecycleNode):
 
     def __init__(self):
         super().__init__('glider_controller')
 
+        # Declare all parameters here so they can be set externally at any time
         self.declare_parameter('Kp_theta', 1.5)
         self.declare_parameter('Ti_theta', 750.0)
         self.declare_parameter('Kp_q', -0.02)
@@ -94,54 +93,125 @@ class GliderController(Node):
         self.declare_parameter('max_dives', 1)
         self.declare_parameter('control_rate_hz', 10.0)
 
+        # Sensor state — updated by subscribers once configured
+        self.theta = 0.0
+        self.q = 0.0
+        self.phi = 0.0
+        self.depth = 0.0
+
+        # Control state — reset on activate
+        self.operating = False
+        self.diving = True
+        self.dive_count = 0
+        self.alpha_ref_raw = 0.0
+        self.shift_trim_raw = 0.0
+        self.vbd_raw_pct = 0
+
+        # Created in on_configure
+        self.pi_theta = None
+        self.pi_q = None
+        self.filt_alpha = None
+        self.filt_shift_trim = None
+        self.filt_vbd = None
+        self.filt_shift_cmd = None
+        self.filt_roll_cmd = None
+        self._sub_imu = None
+        self._sub_depth = None
+        self.pub_pitch_mm = None
+        self.pub_roll_deg = None
+        self.pub_vbd_left = None
+        self.pub_vbd_right = None
+        self.pub_phase = None
+
+        # Created in on_activate
+        self._ctrl_timer = None
+        self.dt = 0.1
+
+    # ── Lifecycle callbacks ──────────────────────────────────────────────────
+
+    def on_configure(self, state):
         self._load_params()
 
         self.pi_theta = PIController(
-            self.Kp_theta, self.Ki_theta,
-            -self.q_cmd_max, self.q_cmd_max)
+            self.Kp_theta, self.Ki_theta, -self.q_cmd_max, self.q_cmd_max)
         self.pi_q = PIController(
-            self.Kp_q, self.Ki_q,
-            self.shift_min_m, self.shift_max_m)
-
+            self.Kp_q, self.Ki_q, self.shift_min_m, self.shift_max_m)
         self.filt_alpha = FirstOrderFilter(self.T_alpha_cmd, self.alpha_dive)
         self.filt_shift_trim = FirstOrderFilter(self.T_shift_trim, 0.0)
         self.filt_vbd = FirstOrderFilter(self.T_vbd_cmd, 0.0)
         self.filt_shift_cmd = FirstOrderFilter(self.shift_cmd_tau, 0.0)
         self.filt_roll_cmd = FirstOrderFilter(self.roll_cmd_tau, 0.0)
 
-        self.operating = False
-        self.diving = True
-        self.dive_count = 0
+        self._sub_imu = self.create_subscription(
+            Imu, '/imu/data', self._cb_imu, 10)
+        self._sub_depth = self.create_subscription(
+            Float64, '/pressure/depth', self._cb_depth, 10)
 
-        self.theta = 0.0
-        self.q = 0.0
-        self.phi = 0.0
-        self.depth = 0.0
-
-        self.alpha_ref_raw = self.alpha_dive
-        self.shift_trim_raw = 0.0
-        self.vbd_raw_pct = 0
-
-        # ── Subscribers ──
-        self.create_subscription(Imu, '/imu/data', self._cb_imu, 10)
-        self.create_subscription(Float64, '/pressure/depth', self._cb_depth, 10)
-        self.create_subscription(String, '/mission/command', self._cb_command, 10)
-
-        # ── Publishers ──
         self.pub_pitch_mm = self.create_publisher(Float64, '/cmd/pitch_mm', 10)
         self.pub_roll_deg = self.create_publisher(Float64, '/cmd/roll_deg', 10)
         self.pub_vbd_left = self.create_publisher(UInt8, '/cmd/vbd_left_pct', 10)
         self.pub_vbd_right = self.create_publisher(UInt8, '/cmd/vbd_right_pct', 10)
         self.pub_phase = self.create_publisher(String, '/controller/phase', 10)
 
-        # ── Timer ──
+        self.get_logger().info('Controller configured')
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_activate(self, state):
+        # Reload params so depth_lower reflects the mission value set by state manager
+        self._load_params()
+
         rate = self.get_parameter('control_rate_hz').value
         self.dt = 1.0 / rate
-        self.timer = self.create_timer(self.dt, self._control_loop)
+
+        # Full state reset for a fresh dive
+        self.dive_count = 0
+        self.diving = True
+        self.pi_theta.reset()
+        self.pi_q.reset()
+        self.filt_alpha.reset(self.alpha_dive)
+        self.filt_shift_trim.reset(0.0)
+        self.filt_vbd.reset(0.0)
+        self.filt_shift_cmd.reset(0.0)
+        self.filt_roll_cmd.reset(0.0)
+        self.alpha_ref_raw = self.alpha_dive
+        self.vbd_raw_pct = 0
+
+        self.operating = True
+        self.dive_count += 1
+        self._ctrl_timer = self.create_timer(self.dt, self._control_loop)
 
         self.get_logger().info(
-            f'Controller ready: outer PI Kp={self.Kp_theta} Ki={self.Ki_theta:.4f}, '
-            f'inner PI Kp={self.Kp_q} Ki={self.Ki_q:.4f}, K_phi={self.K_phi}')
+            f'Controller activated — diving to {self.depth_lower}m (dive #{self.dive_count})')
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_deactivate(self, state):
+        if self._ctrl_timer is not None:
+            self.destroy_timer(self._ctrl_timer)
+            self._ctrl_timer = None
+        self.operating = False
+        self.get_logger().info('Controller deactivated')
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state):
+        if self._sub_imu:
+            self.destroy_subscription(self._sub_imu)
+            self._sub_imu = None
+        if self._sub_depth:
+            self.destroy_subscription(self._sub_depth)
+            self._sub_depth = None
+        for attr in ('pub_pitch_mm', 'pub_roll_deg', 'pub_vbd_left',
+                     'pub_vbd_right', 'pub_phase'):
+            pub = getattr(self, attr, None)
+            if pub:
+                self.destroy_publisher(pub)
+                setattr(self, attr, None)
+        self.get_logger().info('Controller cleaned up')
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state):
+        return TransitionCallbackReturn.SUCCESS
+
+    # ── Parameters ──────────────────────────────────────────────────────────
 
     def _load_params(self):
         p = self.get_parameter
@@ -165,10 +235,11 @@ class GliderController(Node):
         self.roll_cmd_tau = p('roll_cmd_tau').value
         self.max_dives = p('max_dives').value
 
-    # ── Callbacks ──
+    # ── Sensor callbacks ────────────────────────────────────────────────────
 
     def _cb_imu(self, msg):
-        qx, qy, qz, qw = msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
+        qx, qy, qz, qw = (msg.orientation.x, msg.orientation.y,
+                           msg.orientation.z, msg.orientation.w)
         sinr = 2.0 * (qw * qx + qy * qz)
         cosr = 1.0 - 2.0 * (qx * qx + qy * qy)
         self.phi = math.atan2(sinr, cosr)
@@ -179,35 +250,7 @@ class GliderController(Node):
     def _cb_depth(self, msg):
         self.depth = msg.data
 
-    def _cb_command(self, msg):
-        cmd = msg.data.strip().upper()
-        if cmd == 'OPERATION' and not self.operating:
-            self._start_operation()
-        elif cmd != 'OPERATION' and self.operating:
-            self._stop_operation()
-
-    # ── Start / stop ──
-
-    def _start_operation(self):
-        self.operating = True
-        self.diving = True
-        self.dive_count += 1
-        self.pi_theta.reset()
-        self.pi_q.reset()
-        self.filt_alpha.reset(self.alpha_dive)
-        self.filt_shift_trim.reset(0.0)
-        self.filt_vbd.reset(0.0)
-        self.filt_shift_cmd.reset(0.0)
-        self.filt_roll_cmd.reset(0.0)
-        self.alpha_ref_raw = self.alpha_dive
-        self.vbd_raw_pct = 0
-        self.get_logger().info(f'OPERATION started (dive #{self.dive_count})')
-
-    def _stop_operation(self):
-        self.operating = False
-        self.get_logger().info('OPERATION stopped')
-
-    # ── Mission supervisor (Ibrahim's logic) ──
+    # ── Mission supervisor ──────────────────────────────────────────────────
 
     def _mission_supervisor(self):
         if self.diving and self.depth >= self.depth_lower:
@@ -218,7 +261,7 @@ class GliderController(Node):
         elif not self.diving and self.depth <= self.depth_upper:
             if self.dive_count >= self.max_dives:
                 self.operating = False
-                self.get_logger().info('Dive complete')
+                self.get_logger().info('Mission complete — at surface')
                 return False
 
         if self.diving:
@@ -231,52 +274,42 @@ class GliderController(Node):
             self.vbd_raw_pct = 100
         return True
 
-    # ── Main 10 Hz loop ──
+    # ── 10 Hz control loop ──────────────────────────────────────────────────
 
     def _control_loop(self):
-        # Publish current state
-        s = String()
-        s.data = 'OPERATION' if self.operating else 'COMPLETE' if self.dive_count >= self.max_dives else 'IDLE'
-        self.pub_phase.publish(s)
+        phase = String()
+        phase.data = 'OPERATION' if self.operating else 'COMPLETE'
+        self.pub_phase.publish(phase)
 
-        # Not operating — do nothing
         if not self.operating:
             return
 
-        # Mission supervisor: check depth, flip dive/climb
         if not self._mission_supervisor():
             return
 
-        # Smoothing filters
         alpha_filt = self.filt_alpha.update(self.alpha_ref_raw, self.dt)
         shift_trim_filt = self.filt_shift_trim.update(self.shift_trim_raw, self.dt)
         vbd_filt_pct = self.filt_vbd.update(self.vbd_raw_pct, self.dt)
 
-        # Outer PI: angle error → desired pitch rate
         alpha_err = alpha_filt - self.theta
         q_cmd = self.pi_theta.compute(alpha_err, self.dt)
 
-        # Inner PI: rate error → battery shift
         q_err = q_cmd - self.q
         shift_pi_out = self.pi_q.compute(q_err, self.dt)
 
-        # Shift total + smoothing + saturation
         shift_total = shift_pi_out + shift_trim_filt
         shift_smoothed = self.filt_shift_cmd.update(shift_total, self.dt)
         shift_m = max(self.shift_min_m, min(self.shift_max_m, shift_smoothed))
 
-        # Roll P: keep level
         phi_err = 0.0 - self.phi
         roll_p_out = self.K_phi * phi_err
         roll_smoothed = self.filt_roll_cmd.update(roll_p_out, self.dt)
         roll_rad = max(-self.roll_max_rad, min(self.roll_max_rad, roll_smoothed))
 
-        # Convert to CAN protocol units
         shift_mm = shift_m * 1000.0
         roll_deg = math.degrees(roll_rad)
         vbd_pct = max(0, min(100, int(round(vbd_filt_pct))))
 
-        # Publish
         m = Float64(); m.data = shift_mm; self.pub_pitch_mm.publish(m)
         m = Float64(); m.data = roll_deg; self.pub_roll_deg.publish(m)
         m = UInt8(); m.data = vbd_pct; self.pub_vbd_left.publish(m)

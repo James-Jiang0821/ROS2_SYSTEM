@@ -10,6 +10,8 @@ from action_msgs.msg import GoalStatus
 from std_msgs.msg import String, Bool
 from lifecycle_msgs.srv import ChangeState
 from lifecycle_msgs.msg import Transition
+from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
 from glider_msgs.action import IridiumWindow, HomeActuators
 
@@ -34,6 +36,15 @@ class InitialisePhase(Enum):
     WAITING_FOR_HOME_RESULT = auto()
 
 
+class OperationPhase(Enum):
+    CONFIGURING_CONTROLLER = auto()
+    SETTING_DEPTH_PARAM = auto()
+    ACTIVATING_CONTROLLER = auto()
+    RUNNING = auto()
+    DEACTIVATING_CONTROLLER = auto()
+    CLEANING_UP_CONTROLLER = auto()
+
+
 class StateManagerNode(Node):
     def __init__(self):
         super().__init__("state_manager_node")
@@ -44,9 +55,11 @@ class StateManagerNode(Node):
         self.state = MissionState.IDLE
 
         # -----------------------------
-        # Idle sub-phase
+        # Sub-phases
         # -----------------------------
         self.idle_phase = IdlePhase.WAITING_FOR_TIMER
+        self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
+        self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
 
         # -----------------------------
         # Parameters
@@ -56,14 +69,11 @@ class StateManagerNode(Node):
         self.declare_parameter("iridium_max_attempts", 3)
 
         self.idle_iridium_period_s = float(
-            self.get_parameter("idle_iridium_period_s").value
-        )
+            self.get_parameter("idle_iridium_period_s").value)
         self.iridium_settling_time_s = float(
-            self.get_parameter("iridium_settling_time_s").value
-        )
+            self.get_parameter("iridium_settling_time_s").value)
         self.iridium_max_attempts = int(
-            self.get_parameter("iridium_max_attempts").value
-        )
+            self.get_parameter("iridium_max_attempts").value)
 
         # -----------------------------
         # Track timing
@@ -77,12 +87,13 @@ class StateManagerNode(Node):
         self.iridium_goal_in_flight = False
         self.pending_mission_text = ""
         self.emergency_triggered = False
-
-        self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
         self.home_goal_in_flight = False
+        self.controller_complete = False
 
-        # Lifecycle transition future (shared between activate/deactivate calls)
-        self._lc_future = None
+        # Async futures
+        self._iridium_lc_future = None   # Iridium lifecycle transitions
+        self._ctrl_lc_future = None      # Controller lifecycle transitions
+        self._param_future = None        # Controller parameter set
 
         # -----------------------------
         # Publishers
@@ -90,40 +101,30 @@ class StateManagerNode(Node):
         self.state_pub = self.create_publisher(String, "/manager/state", 10)
 
         # -----------------------------
-        # Safety subscription
+        # Subscriptions
         # -----------------------------
-        self.create_subscription(
-            Bool,
-            "/safety/emergency",
-            self.emergency_cb,
-            10
-        )
+        self.create_subscription(Bool, "/safety/emergency", self.emergency_cb, 10)
+        self.create_subscription(String, "/controller/phase", self._controller_phase_cb, 10)
 
         # -----------------------------
-        # Iridium action client
+        # Action clients
         # -----------------------------
-        self.iridium_client = ActionClient(
-            self,
-            IridiumWindow,
-            "/iridium/run_window"
-        )
+        self.iridium_client = ActionClient(self, IridiumWindow, "/iridium/run_window")
+        self.home_client = ActionClient(self, HomeActuators, "/bridge/home_actuators")
 
         # -----------------------------
-        # HomeActuators action client
+        # Lifecycle service clients
         # -----------------------------
-        self.home_client = ActionClient(
-            self,
-            HomeActuators,
-            "/bridge/home_actuators"
-        )
+        self._iridium_lc_client = self.create_client(
+            ChangeState, "/communication_iridium_node/change_state")
+        self._ctrl_lc_client = self.create_client(
+            ChangeState, "/glider_controller/change_state")
 
         # -----------------------------
-        # Iridium lifecycle service client
+        # Parameter service client (controller)
         # -----------------------------
-        self._lc_client = self.create_client(
-            ChangeState,
-            "/communication_iridium_node/change_state"
-        )
+        self._param_client = self.create_client(
+            SetParameters, "/glider_controller/set_parameters")
 
         # -----------------------------
         # Main loop
@@ -139,6 +140,11 @@ class StateManagerNode(Node):
     def emergency_cb(self, msg: Bool):
         if msg.data:
             self.emergency_triggered = True
+
+    def _controller_phase_cb(self, msg: String):
+        if msg.data == 'COMPLETE' and not self.controller_complete:
+            self.get_logger().info("Controller reported mission COMPLETE")
+            self.controller_complete = True
 
     # =========================================================
     # Utility
@@ -164,41 +170,27 @@ class StateManagerNode(Node):
         self.last_idle_cycle_start_ns = self.get_clock().now().nanoseconds
 
     # =========================================================
-    # Lifecycle helpers
+    # Iridium lifecycle helpers
     # =========================================================
 
-    def _send_lc_transition(self, transition_id: int):
-        req = ChangeState.Request()
-        req.transition.id = transition_id
-        return self._lc_client.call_async(req)
-
     def activate_iridium(self) -> Optional[bool]:
-        """
-        Calls the lifecycle 'configure' transition on communication_iridium_node,
-        which opens the serial port and starts the action server.
-
-        Returns:
-            True  — transition completed successfully
-            False — transition failed (or service unavailable)
-            None  — still waiting for the response
-        """
-        if self._lc_future is None:
-            if not self._lc_client.service_is_ready():
-                self.get_logger().warn(
-                    "Iridium lifecycle service not ready; will retry"
-                )
+        """Configure Iridium lifecycle node (unconfigured → inactive, opens serial port)."""
+        if self._iridium_lc_future is None:
+            if not self._iridium_lc_client.service_is_ready():
+                self.get_logger().warn("Iridium lifecycle service not ready; will retry")
                 return False
             self.get_logger().info(
-                "Sending lifecycle 'configure' to communication_iridium_node"
-            )
-            self._lc_future = self._send_lc_transition(Transition.TRANSITION_CONFIGURE)
+                "Sending lifecycle 'configure' to communication_iridium_node")
+            req = ChangeState.Request()
+            req.transition.id = Transition.TRANSITION_CONFIGURE
+            self._iridium_lc_future = self._iridium_lc_client.call_async(req)
             return None
 
-        if not self._lc_future.done():
+        if not self._iridium_lc_future.done():
             return None
 
-        result = self._lc_future.result()
-        self._lc_future = None
+        result = self._iridium_lc_future.result()
+        self._iridium_lc_future = None
 
         if result is None or not result.success:
             self.get_logger().warn("Iridium 'configure' transition failed")
@@ -208,43 +200,118 @@ class StateManagerNode(Node):
         return True
 
     def deactivate_iridium(self) -> Optional[bool]:
-        """
-        Calls the lifecycle 'cleanup' transition on communication_iridium_node,
-        which closes the serial port and stops the action server.
-
-        Returns:
-            True  — done (success or non-critical failure, always proceed)
-            None  — still waiting for the response
-        """
-        if self._lc_future is None:
-            if not self._lc_client.service_is_ready():
+        """Cleanup Iridium lifecycle node (inactive → unconfigured, closes serial port)."""
+        if self._iridium_lc_future is None:
+            if not self._iridium_lc_client.service_is_ready():
                 self.get_logger().warn(
-                    "Iridium lifecycle service not ready; skipping cleanup"
-                )
+                    "Iridium lifecycle service not ready; skipping cleanup")
                 return True
             self.get_logger().info(
-                "Sending lifecycle 'cleanup' to communication_iridium_node"
-            )
-            self._lc_future = self._send_lc_transition(Transition.TRANSITION_CLEANUP)
+                "Sending lifecycle 'cleanup' to communication_iridium_node")
+            req = ChangeState.Request()
+            req.transition.id = Transition.TRANSITION_CLEANUP
+            self._iridium_lc_future = self._iridium_lc_client.call_async(req)
             return None
 
-        if not self._lc_future.done():
+        if not self._iridium_lc_future.done():
             return None
 
-        result = self._lc_future.result()
-        self._lc_future = None
+        result = self._iridium_lc_future.result()
+        self._iridium_lc_future = None
 
         if result is None or not result.success:
-            self.get_logger().warn(
-                "Iridium 'cleanup' transition failed; continuing anyway"
-            )
+            self.get_logger().warn("Iridium 'cleanup' failed; continuing anyway")
         else:
             self.get_logger().info("Iridium node cleaned up")
 
+        return True  # non-critical — always proceed
+
+    # =========================================================
+    # Controller lifecycle helpers
+    # =========================================================
+
+    def _ctrl_lc_call(self, transition_id: int) -> Optional[bool]:
+        """Generic async lifecycle transition for the controller node."""
+        if self._ctrl_lc_future is None:
+            if not self._ctrl_lc_client.service_is_ready():
+                return False
+            req = ChangeState.Request()
+            req.transition.id = transition_id
+            self._ctrl_lc_future = self._ctrl_lc_client.call_async(req)
+            return None
+
+        if not self._ctrl_lc_future.done():
+            return None
+
+        result = self._ctrl_lc_future.result()
+        self._ctrl_lc_future = None
+        return result is not None and result.success
+
+    def configure_controller(self) -> Optional[bool]:
+        result = self._ctrl_lc_call(Transition.TRANSITION_CONFIGURE)
+        if result is True:
+            self.get_logger().info("Controller configured")
+        elif result is False:
+            self.get_logger().warn("Controller lifecycle service not ready; will retry")
+        return result
+
+    def activate_controller(self) -> Optional[bool]:
+        result = self._ctrl_lc_call(Transition.TRANSITION_ACTIVATE)
+        if result is True:
+            self.get_logger().info("Controller activated")
+        elif result is False:
+            self.get_logger().error("Controller 'activate' transition failed")
+        return result
+
+    def deactivate_controller(self) -> Optional[bool]:
+        if not self._ctrl_lc_client.service_is_ready():
+            return True  # non-critical, proceed to cleanup
+        result = self._ctrl_lc_call(Transition.TRANSITION_DEACTIVATE)
+        if result is True:
+            self.get_logger().info("Controller deactivated")
+        return result
+
+    def cleanup_controller(self) -> Optional[bool]:
+        if not self._ctrl_lc_client.service_is_ready():
+            return True
+        result = self._ctrl_lc_call(Transition.TRANSITION_CLEANUP)
+        if result is True:
+            self.get_logger().info("Controller cleaned up")
+        return result
+
+    def set_controller_depth(self, depth_m: float) -> Optional[bool]:
+        """Set depth_lower on the controller node via the parameter service."""
+        if self._param_future is None:
+            if not self._param_client.service_is_ready():
+                self.get_logger().warn(
+                    "Controller parameter service not ready; will retry")
+                return False
+            pv = ParameterValue()
+            pv.type = ParameterType.PARAMETER_DOUBLE
+            pv.double_value = depth_m
+            p = Parameter()
+            p.name = 'depth_lower'
+            p.value = pv
+            req = SetParameters.Request()
+            req.parameters = [p]
+            self._param_future = self._param_client.call_async(req)
+            return None
+
+        if not self._param_future.done():
+            return None
+
+        result = self._param_future.result()
+        self._param_future = None
+
+        if result is None or not all(r.successful for r in result.results):
+            self.get_logger().warn("Failed to set depth_lower on controller")
+            return False
+
+        self.get_logger().info(f"Controller depth_lower set to {depth_m}m")
         return True
 
     # =========================================================
-    # Action helpers
+    # Iridium action helpers
     # =========================================================
 
     def send_iridium_window_goal(self):
@@ -256,15 +323,13 @@ class StateManagerNode(Node):
             return
 
         goal_msg = IridiumWindow.Goal()
-        goal_msg.latest_telemetry = ""  # iridium node uses /iridium/sbdwt subscription
+        goal_msg.latest_telemetry = ""
         goal_msg.max_attempts = self.iridium_max_attempts
         goal_msg.settling_time_s = self.iridium_settling_time_s
 
         self.get_logger().info("Sending /iridium/run_window goal...")
         future = self.iridium_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.iridium_feedback_callback
-        )
+            goal_msg, feedback_callback=self.iridium_feedback_callback)
         future.add_done_callback(self.iridium_goal_response_callback)
 
         self.iridium_goal_in_flight = True
@@ -273,12 +338,10 @@ class StateManagerNode(Node):
     def iridium_feedback_callback(self, feedback_msg):
         fb = feedback_msg.feedback
         self.get_logger().info(
-            f"Iridium window feedback: phase={fb.phase}, attempt={fb.attempt_number}"
-        )
+            f"Iridium window feedback: phase={fb.phase}, attempt={fb.attempt_number}")
 
     def iridium_goal_response_callback(self, future):
         goal_handle = future.result()
-
         if not goal_handle.accepted:
             self.get_logger().warn("/iridium/run_window goal rejected")
             self.iridium_goal_in_flight = False
@@ -310,16 +373,16 @@ class StateManagerNode(Node):
                 self.pending_mission_text = result.mission_text
                 self.get_logger().info(
                     f"Mission received from Iridium: '{self.pending_mission_text}'"
+                    " — deactivating Iridium before homing"
                 )
-                self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
-                self.transition_to(MissionState.INITIALISE)
             else:
                 self.get_logger().info("No mission received; remaining in IDLE")
-                self.idle_phase = IdlePhase.DEACTIVATING_IRIDIUM
+
+            # Always deactivate Iridium before doing anything else
+            self.idle_phase = IdlePhase.DEACTIVATING_IRIDIUM
         else:
             self.get_logger().warn(
-                f"/iridium/run_window ended with status {status}; remaining in IDLE"
-            )
+                f"/iridium/run_window ended with status {status}; remaining in IDLE")
             self.idle_phase = IdlePhase.DEACTIVATING_IRIDIUM
 
     # =========================================================
@@ -339,9 +402,7 @@ class StateManagerNode(Node):
 
         self.get_logger().info("Sending /bridge/home_actuators goal...")
         future = self.home_client.send_goal_async(
-            goal_msg,
-            feedback_callback=self.home_feedback_callback
-        )
+            goal_msg, feedback_callback=self.home_feedback_callback)
         future.add_done_callback(self.home_goal_response_callback)
 
         self.home_goal_in_flight = True
@@ -352,12 +413,10 @@ class StateManagerNode(Node):
         self.get_logger().info(
             f"Homing feedback: vbd_left={fb.vbd_left_homed}, "
             f"vbd_right={fb.vbd_right_homed}, "
-            f"pitch={fb.pitch_homed}, roll={fb.roll_homed}"
-        )
+            f"pitch={fb.pitch_homed}, roll={fb.roll_homed}")
 
     def home_goal_response_callback(self, future):
         goal_handle = future.result()
-
         if not goal_handle.accepted:
             self.get_logger().error("/bridge/home_actuators goal rejected")
             self.home_goal_in_flight = False
@@ -377,6 +436,7 @@ class StateManagerNode(Node):
 
         if status == GoalStatus.STATUS_SUCCEEDED and result.success:
             self.get_logger().info(f"Homing succeeded: {result.status_message}")
+            self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
             self.transition_to(MissionState.OPERATION)
         else:
             self.get_logger().error(f"Homing failed: {result.status_message}")
@@ -398,37 +458,84 @@ class StateManagerNode(Node):
                 self.idle_phase = IdlePhase.SENDING_WINDOW_GOAL
             elif result is False:
                 self.get_logger().warn("Failed to activate Iridium; staying in IDLE")
-                self._lc_future = None
+                self._iridium_lc_future = None
                 self.reset_idle_timer()
                 self.idle_phase = IdlePhase.WAITING_FOR_TIMER
-            # None = still waiting, stay in this phase
 
         elif self.idle_phase == IdlePhase.SENDING_WINDOW_GOAL:
             self.send_iridium_window_goal()
 
         elif self.idle_phase == IdlePhase.WAITING_FOR_WINDOW_RESULT:
-            # Asynchronous action in progress
-            pass
+            pass  # driven by action callbacks
 
         elif self.idle_phase == IdlePhase.DEACTIVATING_IRIDIUM:
             result = self.deactivate_iridium()
             if result is True:
-                self.reset_idle_timer()
-                self.idle_phase = IdlePhase.WAITING_FOR_TIMER
-            # None = still waiting, stay in this phase
+                if self.pending_mission_text:
+                    # Mission waiting — proceed to homing
+                    self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
+                    self.transition_to(MissionState.INITIALISE)
+                else:
+                    self.reset_idle_timer()
+                    self.idle_phase = IdlePhase.WAITING_FOR_TIMER
 
     def handle_initialise(self):
         if self.initialise_phase == InitialisePhase.SENDING_HOME_GOAL:
             self.send_home_goal()
         elif self.initialise_phase == InitialisePhase.WAITING_FOR_HOME_RESULT:
-            pass  # async callbacks drive the transition
+            pass  # driven by action callbacks
 
     def handle_operation(self):
-        # We will fill this in later
-        pass
+        if self.operation_phase == OperationPhase.CONFIGURING_CONTROLLER:
+            result = self.configure_controller()
+            if result is True:
+                self.operation_phase = OperationPhase.SETTING_DEPTH_PARAM
+            # False = service not ready, stay and retry; None = waiting
+
+        elif self.operation_phase == OperationPhase.SETTING_DEPTH_PARAM:
+            try:
+                depth_m = float(self.pending_mission_text)
+            except ValueError:
+                self.get_logger().error(
+                    f"Invalid mission depth: '{self.pending_mission_text}'; going to EMERGENCY")
+                self.transition_to(MissionState.EMERGENCY)
+                return
+            result = self.set_controller_depth(depth_m)
+            if result is True:
+                self.operation_phase = OperationPhase.ACTIVATING_CONTROLLER
+            # False = service not ready, stay and retry; None = waiting
+
+        elif self.operation_phase == OperationPhase.ACTIVATING_CONTROLLER:
+            result = self.activate_controller()
+            if result is True:
+                self.controller_complete = False
+                self.operation_phase = OperationPhase.RUNNING
+            elif result is False:
+                self.get_logger().error("Failed to activate controller; going to EMERGENCY")
+                self.transition_to(MissionState.EMERGENCY)
+
+        elif self.operation_phase == OperationPhase.RUNNING:
+            if self.controller_complete:
+                self.operation_phase = OperationPhase.DEACTIVATING_CONTROLLER
+
+        elif self.operation_phase == OperationPhase.DEACTIVATING_CONTROLLER:
+            result = self.deactivate_controller()
+            if result is True:
+                self.operation_phase = OperationPhase.CLEANING_UP_CONTROLLER
+            # None = waiting; False = service gone, also move on
+
+        elif self.operation_phase == OperationPhase.CLEANING_UP_CONTROLLER:
+            result = self.cleanup_controller()
+            if result is True:
+                self.pending_mission_text = ""
+                self.controller_complete = False
+                self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
+                self.reset_idle_timer()
+                self.idle_phase = IdlePhase.WAITING_FOR_TIMER
+                self.transition_to(MissionState.IDLE)
 
     def handle_emergency(self):
-        # We will fill this in later
+        # Placeholder — safe-state commands will go here
         pass
 
     # =========================================================
