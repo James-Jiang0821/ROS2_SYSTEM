@@ -18,9 +18,13 @@ Key differences between P&R and VBD:
 
 import struct
 import threading
+import time
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionServer
 from std_msgs.msg import Float64, Bool, UInt8, String
+
+from glider_msgs.action import HomeActuators
 
 
 VBD_L  = 1
@@ -60,8 +64,23 @@ class CanBridgeNode(Node):
         self._setup_vbd_interface('left', VBD_L)
         self._setup_vbd_interface('right', VBD_R)
 
-        # Iridium test subscription
-        self.create_subscription(String, '/iridium/incoming', self._cb_iridium, 10)
+        # Internal homed/fault state — written from CAN RX thread, read by action server thread
+        self._home_lock = threading.Lock()
+        self._vbd_left_homed_state = False
+        self._vbd_right_homed_state = False
+        self._pr_pitch_homed_state = False
+        self._pr_roll_homed_state = False
+        self._vbd_left_not_homed_fault = False
+        self._vbd_right_not_homed_fault = False
+        self._pr_pitch_n_home_fault = False
+        self._pr_roll_n_home_fault = False
+
+        self._home_action_server = ActionServer(
+            self,
+            HomeActuators,
+            '/bridge/home_actuators',
+            self._home_execute,
+        )
 
         self._running = True
         self._rx_thread = threading.Thread(target=self._can_rx_loop, daemon=True)
@@ -137,11 +156,6 @@ class CanBridgeNode(Node):
 
     def _cb_pr_home(self, msg):
         self.pr_home = msg.data
-
-    def _cb_iridium(self, msg):
-        self.get_logger().info(f'Iridium: {msg.data}')
-        self.pr_enable = True
-        self.pr_pitch_mm = 10.0
 
     # ══════════════════════════════════════════════
     # Outgoing: ROS topics -> CAN frames
@@ -248,9 +262,15 @@ class CanBridgeNode(Node):
         # P&R: leak is byte 5, bit 2
         self._pub_bool(self.pub_pr_leak, bool(b5 & 0x04))
         # P&R: pitch_homed is byte 4 bit 2, roll_homed is byte 4 bit 3
-        self._pub_bool(self.pub_pr_pitch_homed, bool(b4 & 0x04))
-        self._pub_bool(self.pub_pr_roll_homed, bool(b4 & 0x08))
+        pitch_homed = bool(b4 & 0x04)
+        roll_homed = bool(b4 & 0x08)
+        self._pub_bool(self.pub_pr_pitch_homed, pitch_homed)
+        self._pub_bool(self.pub_pr_roll_homed, roll_homed)
         self._pub_u8(self.pub_pr_seq, seq)
+
+        with self._home_lock:
+            self._pr_pitch_homed_state = pitch_homed
+            self._pr_roll_homed_state = roll_homed
 
         flags = []
         pr_flag_names_b4 = ['pitch_dir','roll_dir','pitch_homed','roll_homed',
@@ -289,8 +309,13 @@ class CanBridgeNode(Node):
         # VBD: homed is byte 4, bit 3
         homed = bool(b4 & 0x08)
         self._pub_bool(getattr(self, f'pub_vbd_{side}_homed'), homed)
-
         self._pub_u8(getattr(self, f'pub_vbd_{side}_seq'), seq)
+
+        with self._home_lock:
+            if node_id == VBD_L:
+                self._vbd_left_homed_state = homed
+            else:
+                self._vbd_right_homed_state = homed
 
     # ── STATUS_FAULT parsing ──
 
@@ -322,6 +347,12 @@ class CanBridgeNode(Node):
         state_names = ['UNHOMED','HOMING','RUN','HOLD','FAULT']
         state_str = state_names[state] if state < len(state_names) else f'UNK({state})'
 
+        with self._home_lock:
+            if 'PITCH_N_HOME' in hards:
+                self._pr_pitch_n_home_fault = True
+            if 'ROLL_N_HOME' in hards:
+                self._pr_roll_n_home_fault = True
+
         self._publish_fault_msg(self.pub_pr_fault, hards, softs, state_str, PR)
 
     def _parse_vbd_fault(self, node_id, d):
@@ -344,6 +375,13 @@ class CanBridgeNode(Node):
         state = d[5]
         state_names = ['UNHOMED','HOMING','RUN','HOLD','FAULT']
         state_str = state_names[state] if state < len(state_names) else f'UNK({state})'
+
+        with self._home_lock:
+            if 'NOT_HOMED' in hards:
+                if node_id == VBD_L:
+                    self._vbd_left_not_homed_fault = True
+                else:
+                    self._vbd_right_not_homed_fault = True
 
         side = 'left' if node_id == VBD_L else 'right'
         pub = getattr(self, f'pub_vbd_{side}_fault')
@@ -392,6 +430,106 @@ class CanBridgeNode(Node):
 
         if bms_flag:
             self.get_logger().warn(f'Node {node_id} BMS flag 0x{bms_flag:02X} {voltage_v:.2f}V {temp_c:.1f}C')
+
+    # ══════════════════════════════════════════════
+    # HomeActuators action server
+    # ══════════════════════════════════════════════
+
+    def _home_execute(self, goal_handle):
+        timeout_s = float(goal_handle.request.timeout_s)
+        if timeout_s <= 0.0:
+            timeout_s = 65.0
+
+        self.get_logger().info(f'HomeActuators: starting (timeout={timeout_s:.0f}s)')
+
+        # Reset homing fault latches from any prior run
+        with self._home_lock:
+            self._vbd_left_not_homed_fault = False
+            self._vbd_right_not_homed_fault = False
+            self._pr_pitch_n_home_fault = False
+            self._pr_roll_n_home_fault = False
+
+        # Command all devices to enable and home — picked up by _republish_commands at 20 Hz
+        self.vbd_left_enable = True
+        self.vbd_left_home = True
+        self.vbd_right_enable = True
+        self.vbd_right_home = True
+        self.pr_enable = True
+        self.pr_home = True
+
+        deadline = time.monotonic() + timeout_s
+
+        while time.monotonic() < deadline:
+            if goal_handle.is_cancel_requested:
+                self._stop_homing()
+                goal_handle.canceled()
+                result = HomeActuators.Result()
+                result.success = False
+                result.status_message = 'Cancelled'
+                return result
+
+            with self._home_lock:
+                vl_h = self._vbd_left_homed_state
+                vr_h = self._vbd_right_homed_state
+                pp_h = self._pr_pitch_homed_state
+                pr_h = self._pr_roll_homed_state
+                vl_f = self._vbd_left_not_homed_fault
+                vr_f = self._vbd_right_not_homed_fault
+                pp_f = self._pr_pitch_n_home_fault
+                pr_f = self._pr_roll_n_home_fault
+
+            feedback = HomeActuators.Feedback()
+            feedback.vbd_left_homed = vl_h
+            feedback.vbd_right_homed = vr_h
+            feedback.pitch_homed = pp_h
+            feedback.roll_homed = pr_h
+            goal_handle.publish_feedback(feedback)
+
+            # Teensy fault latches mean homing failed on that device
+            failed = []
+            if vl_f:
+                failed.append('vbd_left (NOT_HOMED fault)')
+            if vr_f:
+                failed.append('vbd_right (NOT_HOMED fault)')
+            if pp_f:
+                failed.append('pitch (PITCH_N_HOME fault)')
+            if pr_f:
+                failed.append('roll (ROLL_N_HOME fault)')
+
+            if failed:
+                self._stop_homing()
+                goal_handle.abort()
+                result = HomeActuators.Result()
+                result.success = False
+                result.status_message = f'Homing fault on: {", ".join(failed)}'
+                self.get_logger().error(f'HomeActuators: {result.status_message}')
+                return result
+
+            if vl_h and vr_h and pp_h and pr_h:
+                self._stop_homing()
+                goal_handle.succeed()
+                result = HomeActuators.Result()
+                result.success = True
+                result.status_message = 'All actuators homed successfully'
+                self.get_logger().info('HomeActuators: complete')
+                return result
+
+            time.sleep(0.2)
+
+        # Deadline exceeded before Teensy fault — our own timeout
+        self._stop_homing()
+        goal_handle.abort()
+        result = HomeActuators.Result()
+        result.success = False
+        result.status_message = f'Homing timed out after {timeout_s:.0f}s'
+        self.get_logger().error(f'HomeActuators: {result.status_message}')
+        return result
+
+    def _stop_homing(self):
+        """Clear home bits; enable stays on so actuators hold position."""
+        self.vbd_left_home = False
+        self.vbd_right_home = False
+        self.pr_home = False
 
     # ══════════════════════════════════════════════
     # Publish helpers

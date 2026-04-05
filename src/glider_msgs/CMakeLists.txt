@@ -8,6 +8,7 @@ find_package(action_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/IridiumWindow.action"
+  "action/HomeActuators.action"
   DEPENDENCIES builtin_interfaces action_msgs
 )
 

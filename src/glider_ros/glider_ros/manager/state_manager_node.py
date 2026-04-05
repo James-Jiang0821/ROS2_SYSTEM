@@ -11,7 +11,7 @@ from std_msgs.msg import String, Bool
 from lifecycle_msgs.srv import ChangeState
 from lifecycle_msgs.msg import Transition
 
-from glider_msgs.action import IridiumWindow
+from glider_msgs.action import IridiumWindow, HomeActuators
 
 
 class MissionState(Enum):
@@ -27,6 +27,11 @@ class IdlePhase(Enum):
     SENDING_WINDOW_GOAL = auto()
     WAITING_FOR_WINDOW_RESULT = auto()
     DEACTIVATING_IRIDIUM = auto()
+
+
+class InitialisePhase(Enum):
+    SENDING_HOME_GOAL = auto()
+    WAITING_FOR_HOME_RESULT = auto()
 
 
 class StateManagerNode(Node):
@@ -73,6 +78,9 @@ class StateManagerNode(Node):
         self.pending_mission_text = ""
         self.emergency_triggered = False
 
+        self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
+        self.home_goal_in_flight = False
+
         # Lifecycle transition future (shared between activate/deactivate calls)
         self._lc_future = None
 
@@ -98,6 +106,15 @@ class StateManagerNode(Node):
             self,
             IridiumWindow,
             "/iridium/run_window"
+        )
+
+        # -----------------------------
+        # HomeActuators action client
+        # -----------------------------
+        self.home_client = ActionClient(
+            self,
+            HomeActuators,
+            "/bridge/home_actuators"
         )
 
         # -----------------------------
@@ -294,6 +311,7 @@ class StateManagerNode(Node):
                 self.get_logger().info(
                     f"Mission received from Iridium: '{self.pending_mission_text}'"
                 )
+                self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
                 self.transition_to(MissionState.INITIALISE)
             else:
                 self.get_logger().info("No mission received; remaining in IDLE")
@@ -303,6 +321,66 @@ class StateManagerNode(Node):
                 f"/iridium/run_window ended with status {status}; remaining in IDLE"
             )
             self.idle_phase = IdlePhase.DEACTIVATING_IRIDIUM
+
+    # =========================================================
+    # Home action helpers
+    # =========================================================
+
+    def send_home_goal(self):
+        if self.home_goal_in_flight:
+            return
+
+        if not self.home_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("/bridge/home_actuators action server not available yet")
+            return
+
+        goal_msg = HomeActuators.Goal()
+        goal_msg.timeout_s = 0.0  # use bridge default (65 s)
+
+        self.get_logger().info("Sending /bridge/home_actuators goal...")
+        future = self.home_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.home_feedback_callback
+        )
+        future.add_done_callback(self.home_goal_response_callback)
+
+        self.home_goal_in_flight = True
+        self.initialise_phase = InitialisePhase.WAITING_FOR_HOME_RESULT
+
+    def home_feedback_callback(self, feedback_msg):
+        fb = feedback_msg.feedback
+        self.get_logger().info(
+            f"Homing feedback: vbd_left={fb.vbd_left_homed}, "
+            f"vbd_right={fb.vbd_right_homed}, "
+            f"pitch={fb.pitch_homed}, roll={fb.roll_homed}"
+        )
+
+    def home_goal_response_callback(self, future):
+        goal_handle = future.result()
+
+        if not goal_handle.accepted:
+            self.get_logger().error("/bridge/home_actuators goal rejected")
+            self.home_goal_in_flight = False
+            self.transition_to(MissionState.EMERGENCY)
+            return
+
+        self.get_logger().info("/bridge/home_actuators goal accepted")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.home_result_callback)
+
+    def home_result_callback(self, future):
+        result_wrap = future.result()
+        status = result_wrap.status
+        result = result_wrap.result
+
+        self.home_goal_in_flight = False
+
+        if status == GoalStatus.STATUS_SUCCEEDED and result.success:
+            self.get_logger().info(f"Homing succeeded: {result.status_message}")
+            self.transition_to(MissionState.OPERATION)
+        else:
+            self.get_logger().error(f"Homing failed: {result.status_message}")
+            self.transition_to(MissionState.EMERGENCY)
 
     # =========================================================
     # State handlers
@@ -340,8 +418,10 @@ class StateManagerNode(Node):
             # None = still waiting, stay in this phase
 
     def handle_initialise(self):
-        # We will fill this in next
-        pass
+        if self.initialise_phase == InitialisePhase.SENDING_HOME_GOAL:
+            self.send_home_goal()
+        elif self.initialise_phase == InitialisePhase.WAITING_FOR_HOME_RESULT:
+            pass  # async callbacks drive the transition
 
     def handle_operation(self):
         # We will fill this in later

@@ -1,0 +1,14 @@
+# Goal
+float32 timeout_s    # homing timeout override; 0.0 = use default (65.0 s)
+
+---
+# Result
+bool   success
+string status_message
+
+---
+# Feedback
+bool vbd_left_homed
+bool vbd_right_homed
+bool pitch_homed
+bool roll_homed
