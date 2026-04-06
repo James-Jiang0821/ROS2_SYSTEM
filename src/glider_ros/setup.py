@@ -41,7 +41,7 @@ setup(
             'sonar_ping_node = glider_ros.drivers.sonar_ping_node:main',
             'can_bridge_node = glider_ros.manager.can_bridge_node:main',
             'pressure_keller_node = glider_ros.drivers.pressure_keller_node:main',
-            'fake_safety_node = glider_ros.safety.fake_safety_node:main',
+            'safety_node = glider_ros.safety.safety_node:main',
             'telemetry_manager_node = glider_ros.manager.telemetry_manager_node:main',
             'iridium_signal_node = glider_ros.tests.iridium_signal_node:main',
             'bridge_catch_iridium_node = glider_ros.tests.bridge_catch_iridium_node:main',
