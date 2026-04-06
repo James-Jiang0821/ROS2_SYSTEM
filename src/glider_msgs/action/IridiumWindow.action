@@ -2,6 +2,7 @@
 string latest_telemetry      # override outbound payload; empty = use whatever node already has
 int32 max_attempts           # typically 3
 float32 settling_time_s      # seconds to wait before first attempt, typically 60.0
+bool read_mission            # true = IDLE (SBDWT + SBDRT); false = EMERGENCY (SBDWT only)
 
 ---
 # Result — what Iridium tells the state manager

@@ -231,6 +231,7 @@ class IridiumSbdNode(LifecycleNode):
         goal = goal_handle.request
         max_attempts = goal.max_attempts if goal.max_attempts > 0 else 3
         settling_time = goal.settling_time_s if goal.settling_time_s > 0.0 else self.settle_time
+        read_mission = goal.read_mission
 
         # If the goal provides telemetry, use it as the outbound payload override
         if goal.latest_telemetry:
@@ -272,12 +273,12 @@ class IridiumSbdNode(LifecycleNode):
             goal_handle.publish_feedback(feedback)
             self.publish_status(f"Iridium attempt {attempts_used}/{max_attempts}")
 
-            attempt = self._run_one_attempt()
+            attempt = self._run_one_attempt(read_mission=read_mission)
             status_message = attempt["status"]
 
             if attempt["success"]:
                 window_success = True
-                if attempt["mt_text"]:
+                if read_mission and attempt["mt_text"]:
                     mission_received = True
                     mission_text = attempt["mt_text"]
                 break
@@ -319,9 +320,11 @@ class IridiumSbdNode(LifecycleNode):
     # ------------------------------------------------------------------
     # Single SBD attempt
     # ------------------------------------------------------------------
-    def _run_one_attempt(self) -> dict:
+    def _run_one_attempt(self, read_mission: bool = True) -> dict:
         """
         Run one full SBD session attempt.
+        read_mission=True  → SBDWT + SBDIX + SBDRT (normal IDLE window)
+        read_mission=False → SBDWT + SBDIX only, no SBDRT (EMERGENCY window)
         Returns {'success': bool, 'mt_text': str, 'status': str}
         """
         try:
@@ -377,15 +380,17 @@ class IridiumSbdNode(LifecycleNode):
             self.publish_string(self.mt_waiting_pub, str(sbdix.mt_queued))
             self.log_debug(f"SBDIX parsed: {session_summary}")
 
-            # Read MT message if one arrived
+            # Read MT message only if this is a mission-reading window
             mt_text = ""
-            if sbdix.mt_len > 0:
+            if read_mission and sbdix.mt_len > 0:
                 mt_text = self.read_mt_message()
                 if mt_text:
                     self.publish_string(self.mt_pub, mt_text)
                     self.publish_status(f"Received MT: {mt_text}")
                 else:
                     self.publish_status("MT indicated by SBDIX but buffer read empty")
+            elif not read_mission and sbdix.mt_len > 0:
+                self.publish_status(f"MT message waiting ({sbdix.mt_len} bytes) — skipped (emergency window)")
 
             if self.is_session_success(sbdix.mo_status):
                 with self._lock:
