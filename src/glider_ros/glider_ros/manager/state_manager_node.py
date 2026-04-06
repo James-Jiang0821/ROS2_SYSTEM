@@ -115,6 +115,8 @@ class StateManagerNode(Node):
         self.state_pub = self.create_publisher(String, "/manager/state", 10)
         self._force_surface_pub = self.create_publisher(
             Bool, "/controller/force_surface", 10)
+        self._emergency_detail_pub = self.create_publisher(
+            String, "/emergency/detail", 10)
 
         # -----------------------------
         # Subscriptions
@@ -459,8 +461,15 @@ class StateManagerNode(Node):
             self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER
             self.transition_to(MissionState.OPERATION)
         else:
-            self.get_logger().error(f"Homing failed: {result.status_message}")
+            detail = f"Homing failed: {result.status_message}"
+            self.get_logger().error(detail)
+            self._publish_emergency_detail(detail)
             self.transition_to(MissionState.EMERGENCY)
+
+    def _publish_emergency_detail(self, detail: str):
+        msg = String()
+        msg.data = detail
+        self._emergency_detail_pub.publish(msg)
 
     # =========================================================
     # State handlers
