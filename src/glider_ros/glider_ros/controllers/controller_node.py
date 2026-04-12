@@ -26,7 +26,6 @@ import math
 import rclpy
 from rclpy.lifecycle import LifecycleNode, TransitionCallbackReturn
 from std_msgs.msg import Bool, Float64, String, UInt8
-from sensor_msgs.msg import Imu
 
 
 class PIController:
@@ -109,6 +108,9 @@ class GliderController(LifecycleNode):
 
         # Created in on_configure
         self._sub_force_surface = None
+        self._sub_roll = None
+        self._sub_pitch = None
+        self._sub_pitch_rate = None
         self.pi_theta = None
         self.pi_q = None
         self.filt_alpha = None
@@ -116,7 +118,6 @@ class GliderController(LifecycleNode):
         self.filt_vbd = None
         self.filt_shift_cmd = None
         self.filt_roll_cmd = None
-        self._sub_imu = None
         self._sub_depth = None
         self.pub_pitch_mm = None
         self.pub_roll_deg = None
@@ -143,10 +144,14 @@ class GliderController(LifecycleNode):
         self.filt_shift_cmd = FirstOrderFilter(self.shift_cmd_tau, 0.0)
         self.filt_roll_cmd = FirstOrderFilter(self.roll_cmd_tau, 0.0)
 
-        self._sub_imu = self.create_subscription(
-            Imu, '/imu/data', self._cb_imu, 10)
+        self._sub_roll = self.create_subscription(
+            Float64, '/glider/roll_rad', self._cb_roll, 10)
+        self._sub_pitch = self.create_subscription(
+            Float64, '/glider/pitch_rad', self._cb_pitch, 10)
+        self._sub_pitch_rate = self.create_subscription(
+            Float64, '/glider/pitch_rate_rad_s', self._cb_pitch_rate, 10)
         self._sub_depth = self.create_subscription(
-            Float64, '/pressure/depth', self._cb_depth, 10)
+            Float64, '/glider/depth', self._cb_depth, 10)
         self._sub_force_surface = self.create_subscription(
             Bool, '/controller/force_surface', self._cb_force_surface, 10)
 
@@ -196,15 +201,11 @@ class GliderController(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_cleanup(self, state):
-        if self._sub_imu:
-            self.destroy_subscription(self._sub_imu)
-            self._sub_imu = None
-        if self._sub_depth:
-            self.destroy_subscription(self._sub_depth)
-            self._sub_depth = None
-        if self._sub_force_surface:
-            self.destroy_subscription(self._sub_force_surface)
-            self._sub_force_surface = None
+        for attr in ('_sub_roll', '_sub_pitch', '_sub_pitch_rate', '_sub_depth', '_sub_force_surface'):
+            sub = getattr(self, attr, None)
+            if sub:
+                self.destroy_subscription(sub)
+                setattr(self, attr, None)
         for attr in ('pub_pitch_mm', 'pub_roll_deg', 'pub_vbd_left',
                      'pub_vbd_right', 'pub_phase'):
             pub = getattr(self, attr, None)
@@ -243,15 +244,14 @@ class GliderController(LifecycleNode):
 
     # ── Sensor callbacks ────────────────────────────────────────────────────
 
-    def _cb_imu(self, msg):
-        qx, qy, qz, qw = (msg.orientation.x, msg.orientation.y,
-                           msg.orientation.z, msg.orientation.w)
-        sinr = 2.0 * (qw * qx + qy * qz)
-        cosr = 1.0 - 2.0 * (qx * qx + qy * qy)
-        self.phi = math.atan2(sinr, cosr)
-        sinp = 2.0 * (qw * qy - qz * qx)
-        self.theta = math.asin(max(-1.0, min(1.0, sinp)))
-        self.q = msg.angular_velocity.y
+    def _cb_roll(self, msg: Float64):
+        self.phi = msg.data
+
+    def _cb_pitch(self, msg: Float64):
+        self.theta = msg.data
+
+    def _cb_pitch_rate(self, msg: Float64):
+        self.q = msg.data
 
     def _cb_depth(self, msg):
         self.depth = msg.data

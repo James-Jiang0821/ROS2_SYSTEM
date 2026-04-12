@@ -46,6 +46,9 @@ setup(
             'iridium_signal_node = glider_ros.tests.iridium_signal_node:main',
             'bridge_catch_iridium_node = glider_ros.tests.bridge_catch_iridium_node:main',
             'state_manager_node = glider_ros.manager.state_manager_node:main',
+            'pressure_manager_node = glider_ros.manager.pressure_manager_node:main',
+            'imu_manager_node = glider_ros.manager.imu_manager_node:main',
+            'sonar_manager_node = glider_ros.manager.sonar_manager_node:main',
         ],
     },
 )
