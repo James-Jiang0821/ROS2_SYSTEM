@@ -151,7 +151,7 @@ class GliderController(LifecycleNode):
         self._sub_pitch_rate = self.create_subscription(
             Float64, '/glider/pitch_rate_rad_s', self._cb_pitch_rate, 10)
         self._sub_depth = self.create_subscription(
-            Float64, '/glider/depth', self._cb_depth, 10)
+            Float64, '/pressure/depth', self._cb_depth, 10)
         self._sub_force_surface = self.create_subscription(
             Bool, '/controller/force_surface', self._cb_force_surface, 10)
 
