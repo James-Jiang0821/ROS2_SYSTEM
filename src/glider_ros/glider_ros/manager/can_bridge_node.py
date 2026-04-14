@@ -44,6 +44,17 @@ class CanBridgeNode(Node):
 
         self.declare_parameter('can_channel', 'can0')
         self.declare_parameter('republish_rate_hz', 20.0)
+        self.declare_parameter('home_vbd_left', True)       #Does it exist
+        self.declare_parameter('home_vbd_right', True)      #Does it exist
+        self.declare_parameter('home_pr', True)             #Does it exist
+
+        self._home_vbd_left = self.get_parameter('home_vbd_left').value
+        self._home_vbd_right = self.get_parameter('home_vbd_right').value
+        self._home_pr = self.get_parameter('home_pr').value
+
+        self.get_logger().info(
+            f'Homing config — vbd_left:{self._home_vbd_left} '
+            f'vbd_right:{self._home_vbd_right} pr:{self._home_pr}')
 
         channel = self.get_parameter('can_channel').value
 
@@ -435,13 +446,16 @@ class CanBridgeNode(Node):
             self._pr_pitch_n_home_fault = False
             self._pr_roll_n_home_fault = False
 
-        # Command all devices to enable and home — picked up by _republish_commands at 20 Hz
-        self.vbd_left_enable = True
-        self.vbd_left_home = True
-        self.vbd_right_enable = True
-        self.vbd_right_home = True
-        self.pr_enable = True
-        self.pr_home = True
+        # Command enabled devices to home — picked up by _republish_commands at 20 Hz
+        if self._home_vbd_left:
+            self.vbd_left_enable = True
+            self.vbd_left_home = True
+        if self._home_vbd_right:
+            self.vbd_right_enable = True
+            self.vbd_right_home = True
+        if self._home_pr:
+            self.pr_enable = True
+            self.pr_home = True
 
         deadline = time.monotonic() + timeout_s
 
@@ -471,15 +485,15 @@ class CanBridgeNode(Node):
             feedback.roll_homed = pr_h
             goal_handle.publish_feedback(feedback)
 
-            # Teensy fault latches mean homing failed on that device
+            # Teensy fault latches mean homing failed on that device (only check enabled ones)
             failed = []
-            if vl_f:
+            if self._home_vbd_left and vl_f:
                 failed.append('vbd_left (NOT_HOMED fault)')
-            if vr_f:
+            if self._home_vbd_right and vr_f:
                 failed.append('vbd_right (NOT_HOMED fault)')
-            if pp_f:
+            if self._home_pr and pp_f:
                 failed.append('pitch (PITCH_N_HOME fault)')
-            if pr_f:
+            if self._home_pr and pr_f:
                 failed.append('roll (ROLL_N_HOME fault)')
 
             if failed:
@@ -491,7 +505,13 @@ class CanBridgeNode(Node):
                 self.get_logger().error(f'HomeActuators: {result.status_message}')
                 return result
 
-            if vl_h and vr_h and pp_h and pr_h:
+            all_homed = (
+                (vl_h or not self._home_vbd_left) and
+                (vr_h or not self._home_vbd_right) and
+                (pp_h or not self._home_pr) and
+                (pr_h or not self._home_pr)
+            )
+            if all_homed:
                 self._stop_homing()
                 goal_handle.succeed()
                 result = HomeActuators.Result()
