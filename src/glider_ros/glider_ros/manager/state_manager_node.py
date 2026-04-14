@@ -124,7 +124,7 @@ class StateManagerNode(Node):
         self._force_surface_pub = self.create_publisher(
             Bool, "/controller/force_surface", 10)
         self._emergency_detail_pub = self.create_publisher(
-            String, "/emergency/detail", 10)
+            String, "/state/detail", 10)
 
         # -----------------------------
         # Subscriptions
@@ -479,6 +479,7 @@ class StateManagerNode(Node):
         if not goal_handle.accepted:
             self.get_logger().error("/bridge/home_actuators goal rejected")
             self.home_goal_in_flight = False
+            self._publish_emergency_detail("Homing failed: action goal rejected by bridge")
             self.transition_to(MissionState.EMERGENCY)
             return
 
@@ -562,8 +563,9 @@ class StateManagerNode(Node):
             try:
                 depth_m = float(self.pending_mission_text)
             except ValueError:
-                self.get_logger().error(
-                    f"Invalid mission depth: '{self.pending_mission_text}'; going to EMERGENCY")
+                detail = f"Invalid mission depth: '{self.pending_mission_text}'"
+                self.get_logger().error(f"{detail}; going to EMERGENCY")
+                self._publish_emergency_detail(detail)
                 self.transition_to(MissionState.EMERGENCY)
                 return
             result = self.set_controller_depth(depth_m)
@@ -579,6 +581,7 @@ class StateManagerNode(Node):
                 self.operation_phase = OperationPhase.RUNNING
             elif result is False:
                 self.get_logger().error("Failed to activate controller; going to EMERGENCY")
+                self._publish_emergency_detail("Controller activation failed")
                 self.transition_to(MissionState.EMERGENCY)
 
         elif self.operation_phase == OperationPhase.RUNNING:

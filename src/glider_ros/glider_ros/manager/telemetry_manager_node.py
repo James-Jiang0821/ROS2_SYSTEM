@@ -24,12 +24,14 @@ class TelemetryManagerNode(Node):
         self.latest_lat = None
         self.latest_lon = None
         self.latest_state = "UNKNOWN"
-        self.latest_emergency_detail = None
+        self._safety_detail = None
+        self._state_detail = None
 
         # Subscriptions
         self.create_subscription(NavSatFix, "/gps/fix", self._cb_gps, 10)
         self.create_subscription(String, "/manager/state", self._cb_state, 10)
-        self.create_subscription(String, "/emergency/detail", self._cb_emergency_detail, 10)
+        self.create_subscription(String, "/safety/detail", self._cb_safety_detail, 10)
+        self.create_subscription(String, "/state/detail", self._cb_state_detail, 10)
 
         # Publisher
         self.telemetry_pub = self.create_publisher(String, "/iridium/sbdwt", 10)
@@ -48,8 +50,11 @@ class TelemetryManagerNode(Node):
     def _cb_state(self, msg: String):
         self.latest_state = msg.data.strip()
 
-    def _cb_emergency_detail(self, msg: String):
-        self.latest_emergency_detail = msg.data.strip()
+    def _cb_safety_detail(self, msg: String):
+        self._safety_detail = msg.data.strip()
+
+    def _cb_state_detail(self, msg: String):
+        self._state_detail = msg.data.strip()
 
     # ── Telemetry building ───────────────────────────────────────────────────
 
@@ -66,8 +71,9 @@ class TelemetryManagerNode(Node):
             parts.append("LON=UNKNOWN")
 
         if self.latest_state == "EMERGENCY":
-            if self.latest_emergency_detail is not None:
-                parts.append(f"ERROR={self.latest_emergency_detail}")
+            details = [d for d in (self._safety_detail, self._state_detail) if d is not None]
+            if details:
+                parts.append(f"ERROR={' | '.join(details)}")
             elif self.include_unknown_fields:
                 parts.append("ERROR=UNKNOWN")
 
