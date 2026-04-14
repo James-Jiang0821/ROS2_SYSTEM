@@ -132,6 +132,7 @@ class StateManagerNode(Node):
         self.create_subscription(Bool, "/safety/emergency", self.emergency_cb, 10)
         self.create_subscription(String, "/controller/phase", self._controller_phase_cb, 10)
         self.create_subscription(Float64, "/pressure/depth", self._depth_cb, 10)
+        self.create_subscription(Float64, "/mission/inject", self._mission_inject_cb, 10)
 
         # -----------------------------
         # Action clients
@@ -175,6 +176,17 @@ class StateManagerNode(Node):
         if msg.data == 'COMPLETE' and not self.controller_complete:
             self.get_logger().info("Controller reported mission COMPLETE")
             self.controller_complete = True
+
+    def _mission_inject_cb(self, msg: Float64):
+        if self.state != MissionState.IDLE:
+            self.get_logger().warn(
+                f"Mission inject ignored — not in IDLE (current state: {self.state.name})")
+            return
+        self.pending_mission_text = str(msg.data)
+        self.get_logger().info(
+            f"Mission injected directly: depth={msg.data}m — skipping Iridium, proceeding to INITIALISE")
+        self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
+        self.transition_to(MissionState.INITIALISE)
 
     # =========================================================
     # Utility
