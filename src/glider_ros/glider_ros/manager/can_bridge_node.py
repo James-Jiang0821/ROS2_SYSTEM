@@ -114,6 +114,8 @@ class CanBridgeNode(Node):
 
         self.create_subscription(Float64, '/controller/pitch_mm', self._cb_pr_pitch, 10)
         self.create_subscription(Float64, '/controller/roll_deg', self._cb_pr_roll, 10)
+        self.create_subscription(Bool, '/controller/pr_enable', self._cb_pr_enable, 10)
+        self.create_subscription(Bool, '/controller/pr_home', self._cb_pr_home, 10)
 
         self.pub_pr_pitch_pos = self.create_publisher(Float64, '/bridge/pr/pitch_pos_mm', 10)
         self.pub_pr_roll_pos = self.create_publisher(Float64, '/bridge/pr/roll_pos_deg', 10)
@@ -136,6 +138,12 @@ class CanBridgeNode(Node):
         self.create_subscription(
             UInt8, f'/controller/vbd_{side}_pct',
             lambda msg, s=side: setattr(self, f'vbd_{s}_pct', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/controller/vbd_{side}_enable',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_enable', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/controller/vbd_{side}_home',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_home', msg.data), 10)
 
         for name, typ in [('pos_mm', Float64), ('tof_mm', Float64), ('leak', Bool),
                           ('homed', Bool), ('seq', UInt8), ('fault', String),
@@ -153,6 +161,12 @@ class CanBridgeNode(Node):
 
     def _cb_pr_roll(self, msg):
         self.pr_roll_deg = max(-90.0, min(90.0, msg.data))
+
+    def _cb_pr_enable(self, msg):
+        self.pr_enable = msg.data
+
+    def _cb_pr_home(self, msg):
+        self.pr_home = msg.data
 
     # ══════════════════════════════════════════════
     # Outgoing: ROS topics -> CAN frames
