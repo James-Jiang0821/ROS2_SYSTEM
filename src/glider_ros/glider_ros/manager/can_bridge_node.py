@@ -22,6 +22,8 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Float64, Bool, UInt8, String
 
 from glider_msgs.action import HomeActuators
@@ -61,7 +63,7 @@ class CanBridgeNode(Node):
         try:
             import can as _can
             self.can = _can
-            self.bus = _can.interface.Bus(channel=channel, bustype='socketcan')
+            self.bus = _can.interface.Bus(channel=channel, interface='socketcan')
             self.get_logger().info(f'CAN bus opened on {channel}')
         except Exception as e:
             self.get_logger().error(f'Failed to open CAN: {e}')
@@ -86,11 +88,15 @@ class CanBridgeNode(Node):
         self._pr_pitch_n_home_fault = False
         self._pr_roll_n_home_fault = False
 
+        # Action runs on its own callback group so the 20 Hz _republish_commands
+        # timer can keep transmitting CAN frames while _home_execute is blocking.
+        self._action_cb_group = ReentrantCallbackGroup()
         self._home_action_server = ActionServer(
             self,
             HomeActuators,
             '/bridge/home_actuators',
             self._home_execute,
+            callback_group=self._action_cb_group,
         )
 
         self._running = True
@@ -574,8 +580,10 @@ class CanBridgeNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CanBridgeNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
