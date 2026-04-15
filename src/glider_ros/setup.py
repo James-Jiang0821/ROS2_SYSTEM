@@ -48,6 +48,7 @@ setup(
             'state_manager_node = glider_ros.manager.state_manager_node:main',
             'imu_manager_node = glider_ros.manager.imu_manager_node:main',
             'sonar_manager_node = glider_ros.manager.sonar_manager_node:main',
+            'controller_node = glider_ros.controller.controller_node:main',
         ],
     },
 )
