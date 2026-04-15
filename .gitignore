@@ -3,6 +3,8 @@ build/
 install/
 log/
 devel/
+.coverage
+htmlcov/
 
 # Colcon / catkin misc
 *.log
