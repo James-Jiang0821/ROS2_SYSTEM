@@ -5,6 +5,16 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float64, String
 
 
+WATCHDOG_STALENESS_THRESHOLD_S = 1200.0 # currently 20 mins
+
+WATCHDOG_TOPICS = [
+    "/glider/roll_rad",
+    "/glider/pitch_rad",
+    "/glider/pitch_rate_rad_s",
+    "/pressure/depth",
+]
+
+
 class SafetyNode(Node):
     """
     Monitors hard faults from the CAN bridge and triggers emergency state.
@@ -14,6 +24,10 @@ class SafetyNode(Node):
         /bridge/vbd_left/fault  (String)  — VBD left Teensy fault messages
         /bridge/vbd_right/fault (String)  — VBD right Teensy fault messages
         /glider/range           (Float64) — filtered sonar altitude (m)
+        /glider/roll_rad        (Float64) — watchdog: stale → emergency
+        /glider/pitch_rad       (Float64) — watchdog: stale → emergency
+        /glider/pitch_rate_rad_s (Float64) — watchdog: stale → emergency
+        /pressure/depth         (Float64) — watchdog: stale → emergency
 
     Publishes:
         /safety/emergency  (Bool)   — latched True once triggered;
@@ -29,9 +43,17 @@ class SafetyNode(Node):
         self._proximity_threshold_m = float(
             self.get_parameter("proximity_threshold_m").value)
 
+        self.declare_parameter("staleness_threshold_s", WATCHDOG_STALENESS_THRESHOLD_S)
+        self._staleness_threshold_s = float(
+            self.get_parameter("staleness_threshold_s").value)
+
         # Latch: once a hard fault fires we stay in emergency
         self._emergency_latched = False
         self._emergency_detail = ""
+
+        # Watchdog: track last received time per topic (None = never received)
+        self._last_received: dict = {t: None for t in WATCHDOG_TOPICS}
+        self._node_start_ns = self.get_clock().now().nanoseconds
 
         # Publishers
         self._emergency_pub = self.create_publisher(Bool, "/safety/emergency", 10)
@@ -49,11 +71,22 @@ class SafetyNode(Node):
         self.create_subscription(
             Float64, "/glider/range", self._cb_range, 10)
 
+        # Watchdog subscriptions
+        for topic in WATCHDOG_TOPICS:
+            self.create_subscription(
+                Float64, topic,
+                lambda msg, t=topic: self._cb_watchdog(t),
+                20)
+
         # 2 Hz republish timer — mirrors the Teensy fault-latch broadcast rate
         self.create_timer(0.5, self._republish_emergency)
 
+        # Staleness check timer — runs every 10 s (threshold is 120 s)
+        self.create_timer(10.0, self._check_staleness)
+
         self.get_logger().info(
-            f"Safety node started (proximity threshold: {self._proximity_threshold_m}m)")
+            f"Safety node started (proximity threshold: {self._proximity_threshold_m}m, "
+            f"staleness threshold: {self._staleness_threshold_s}s)")
 
     # ── Fault callbacks ───────────────────────────────────────────────────────
 
@@ -71,6 +104,27 @@ class SafetyNode(Node):
         if range_m < self._proximity_threshold_m:
             detail = f"Proximity alert: obstacle {range_m:.2f}m away (threshold {self._proximity_threshold_m:.1f}m)"
             self._trigger_emergency(detail)
+
+    def _cb_watchdog(self, topic: str):
+        self._last_received[topic] = self.get_clock().now().nanoseconds
+
+    def _check_staleness(self):
+        if self._emergency_latched:
+            return
+
+        now_ns = self.get_clock().now().nanoseconds
+
+        for topic, last_ns in self._last_received.items():
+            reference_ns = last_ns if last_ns is not None else self._node_start_ns
+            elapsed_s = (now_ns - reference_ns) / 1e9
+
+            if elapsed_s > self._staleness_threshold_s:
+                detail = (
+                    f"Watchdog: {topic} has not published for "
+                    f"{elapsed_s:.0f}s (threshold {self._staleness_threshold_s:.0f}s)"
+                )
+                self._trigger_emergency(detail)
+                return
 
     # ── Core logic ────────────────────────────────────────────────────────────
 
