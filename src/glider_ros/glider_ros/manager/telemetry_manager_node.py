@@ -11,7 +11,7 @@ from sensor_msgs.msg import NavSatFix
 
 class TelemetryManagerNode(Node):
     def __init__(self):
-        super().__init__("telemetry_manager")
+        super().__init__("telemetry_manager_node")
 
         self.declare_parameter("publish_period", 5.0)
         self.declare_parameter("include_unknown_fields", True)
