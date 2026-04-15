@@ -25,6 +25,7 @@ class ImuManagerNode(Node):
         self._roll_pub = self.create_publisher(Float64, "/glider/roll_rad", 20)
         self._pitch_pub = self.create_publisher(Float64, "/glider/pitch_rad", 20)
         self._pitch_rate_pub = self.create_publisher(Float64, "/glider/pitch_rate_rad_s", 20)
+        self._roll_rate_pub = self.create_publisher(Float64, "/glider/roll_rate_rad_s", 20)
         self._heading_pub = self.create_publisher(Float64, "/glider/heading_deg", 20)
 
     def _on_imu(self, msg: Imu) -> None:
@@ -40,10 +41,12 @@ class ImuManagerNode(Node):
 
         heading_deg = math.degrees(yaw) % 360.0
         pitch_rate = msg.angular_velocity.y
+        roll_rate = msg.angular_velocity.x
 
         self._roll_pub.publish(Float64(data=roll))
         self._pitch_pub.publish(Float64(data=pitch))
         self._pitch_rate_pub.publish(Float64(data=pitch_rate))
+        self._roll_rate_pub.publish(Float64(data=roll_rate))
         self._heading_pub.publish(Float64(data=heading_deg))
 
 
