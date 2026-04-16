@@ -5,6 +5,12 @@ from launch_ros.actions import LifecycleNode, Node
 def generate_launch_description():
     return LaunchDescription([
         # --- Drivers ---
+        # Node(
+        #     package='glider_ros',
+        #     executable='imu_bno085_node',
+        #     name='imu_bno085_node',
+        #     output='screen'
+        # ),
         Node(
             package='glider_ros',
             executable='gnss_maxm10s_i2c_node',
@@ -38,12 +44,12 @@ def generate_launch_description():
             name='telemetry_manager_node',
             output='screen'
         ),
-        Node(
-            package='glider_ros',
-            executable='state_manager_node',
-            name='state_manager_node',
-            output='screen'
-        ),
+        # Node(
+        #     package='glider_ros',
+        #     executable='state_manager_node',
+        #     name='state_manager_node',
+        #     output='screen'
+        # ),
         Node(
             package='glider_ros',
             executable='imu_manager_node',
