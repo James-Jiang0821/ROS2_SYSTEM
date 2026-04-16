@@ -40,12 +40,6 @@ def generate_launch_description():
         # --- Managers ---
         Node(
             package='glider_ros',
-            executable='can_bridge_node',
-            name='can_bridge_node',
-            output='screen'
-        ),
-        Node(
-            package='glider_ros',
             executable='telemetry_manager_node',
             name='telemetry_manager_node',
             output='screen'
