@@ -70,8 +70,6 @@ class KellerLD:
     def _read_block(self, length: int) -> list[int]:
         return self.bus.read_i2c_block_data(self.address, 0x00, length)
 
-    from smbus2 import i2c_msg
-
     def read_memory_map(self, mtp_address):
 
         # Write the memory address

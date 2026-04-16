@@ -77,7 +77,7 @@ class StateManagerNode(Node):
         # -----------------------------
         # Parameters
         # -----------------------------
-        self.declare_parameter("idle_iridium_period_s", 300.0)    # 5 min
+        self.declare_parameter("idle_iridium_period_s", 100.0)    # 5 min change
         self.declare_parameter("emergency_iridium_period_s", 300.0)  # 5 min
         self.declare_parameter("iridium_settling_time_s", 60.0)
         self.declare_parameter("iridium_max_attempts", 3)
@@ -105,7 +105,7 @@ class StateManagerNode(Node):
         # State variables
         # -----------------------------
         self.iridium_goal_in_flight = False
-        self.pending_mission_text = ""
+        self.pending_mission_depth: Optional[float] = None
         self.emergency_triggered = False
         self.home_goal_in_flight = False
         self.controller_complete = False
@@ -182,7 +182,7 @@ class StateManagerNode(Node):
             self.get_logger().warn(
                 f"Mission inject ignored — not in IDLE (current state: {self.state.name})")
             return
-        self.pending_mission_text = str(msg.data)
+        self.pending_mission_depth = float(msg.data)
         self.get_logger().info(
             f"Mission injected directly: depth={msg.data}m — skipping Iridium, proceeding to INITIALISE")
         self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
@@ -442,11 +442,17 @@ class StateManagerNode(Node):
                 self.get_logger().warn("Iridium window failed; remaining in IDLE")
 
             if result.mission_received:
-                self.pending_mission_text = result.mission_text
-                self.get_logger().info(
-                    f"Mission received from Iridium: '{self.pending_mission_text}'"
-                    " — deactivating Iridium before homing"
-                )
+                try:
+                    self.pending_mission_depth = float(result.mission_text.strip())
+                    self.get_logger().info(
+                        f"Mission received from Iridium: depth={self.pending_mission_depth}m"
+                        " — deactivating Iridium before homing"
+                    )
+                except ValueError:
+                    self.get_logger().warn(
+                        f"Iridium mission payload not a number: '{result.mission_text}'"
+                        " — ignoring"
+                    )
             else:
                 self.get_logger().info("No mission received; remaining in IDLE")
         else:
@@ -550,7 +556,7 @@ class StateManagerNode(Node):
         elif self.idle_phase == IdlePhase.DEACTIVATING_IRIDIUM:
             result = self.deactivate_iridium()
             if result is True:
-                if self.pending_mission_text:
+                if self.pending_mission_depth is not None:
                     # Mission waiting — proceed to homing
                     self.initialise_phase = InitialisePhase.SENDING_HOME_GOAL
                     self.transition_to(MissionState.INITIALISE)
@@ -572,15 +578,13 @@ class StateManagerNode(Node):
             # False = service not ready, stay and retry; None = waiting
 
         elif self.operation_phase == OperationPhase.SETTING_DEPTH_PARAM:
-            try:
-                depth_m = float(self.pending_mission_text)
-            except ValueError:
-                detail = f"Invalid mission depth: '{self.pending_mission_text}'"
+            if self.pending_mission_depth is None:
+                detail = "No pending mission depth in SETTING_DEPTH_PARAM"
                 self.get_logger().error(f"{detail}; going to EMERGENCY")
                 self._publish_emergency_detail(detail)
                 self.transition_to(MissionState.EMERGENCY)
                 return
-            result = self.set_controller_depth(depth_m)
+            result = self.set_controller_depth(self.pending_mission_depth)
             if result is True:
                 self.operation_phase = OperationPhase.ACTIVATING_CONTROLLER
             # False = service not ready, stay and retry; None = waiting
@@ -609,7 +613,7 @@ class StateManagerNode(Node):
         elif self.operation_phase == OperationPhase.CLEANING_UP_CONTROLLER:
             result = self.cleanup_controller()
             if result is True:
-                self.pending_mission_text = ""
+                self.pending_mission_depth = None
                 self.controller_complete = False
                 self._controller_active = False
                 self.operation_phase = OperationPhase.CONFIGURING_CONTROLLER

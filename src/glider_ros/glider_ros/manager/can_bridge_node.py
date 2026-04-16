@@ -22,6 +22,8 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import Float64, Bool, UInt8, String
 
 from glider_msgs.action import HomeActuators
@@ -61,7 +63,7 @@ class CanBridgeNode(Node):
         try:
             import can as _can
             self.can = _can
-            self.bus = _can.interface.Bus(channel=channel, bustype='socketcan')
+            self.bus = _can.interface.Bus(channel=channel, interface='socketcan')
             self.get_logger().info(f'CAN bus opened on {channel}')
         except Exception as e:
             self.get_logger().error(f'Failed to open CAN: {e}')
@@ -86,11 +88,15 @@ class CanBridgeNode(Node):
         self._pr_pitch_n_home_fault = False
         self._pr_roll_n_home_fault = False
 
+        # Action runs on its own callback group so the 20 Hz _republish_commands
+        # timer can keep transmitting CAN frames while _home_execute is blocking.
+        self._action_cb_group = ReentrantCallbackGroup()
         self._home_action_server = ActionServer(
             self,
             HomeActuators,
             '/bridge/home_actuators',
             self._home_execute,
+            callback_group=self._action_cb_group,
         )
 
         self._running = True
@@ -114,6 +120,8 @@ class CanBridgeNode(Node):
 
         self.create_subscription(Float64, '/controller/pitch_mm', self._cb_pr_pitch, 10)
         self.create_subscription(Float64, '/controller/roll_deg', self._cb_pr_roll, 10)
+        self.create_subscription(Bool, '/controller/pr_enable', self._cb_pr_enable, 10)
+        self.create_subscription(Bool, '/controller/pr_home', self._cb_pr_home, 10)
 
         self.pub_pr_pitch_pos = self.create_publisher(Float64, '/bridge/pr/pitch_pos_mm', 10)
         self.pub_pr_roll_pos = self.create_publisher(Float64, '/bridge/pr/roll_pos_deg', 10)
@@ -136,6 +144,12 @@ class CanBridgeNode(Node):
         self.create_subscription(
             UInt8, f'/controller/vbd_{side}_pct',
             lambda msg, s=side: setattr(self, f'vbd_{s}_pct', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/controller/vbd_{side}_enable',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_enable', msg.data), 10)
+        self.create_subscription(
+            Bool, f'/controller/vbd_{side}_home',
+            lambda msg, s=side: setattr(self, f'vbd_{s}_home', msg.data), 10)
 
         for name, typ in [('pos_mm', Float64), ('tof_mm', Float64), ('leak', Bool),
                           ('homed', Bool), ('seq', UInt8), ('fault', String),
@@ -153,6 +167,12 @@ class CanBridgeNode(Node):
 
     def _cb_pr_roll(self, msg):
         self.pr_roll_deg = max(-90.0, min(90.0, msg.data))
+
+    def _cb_pr_enable(self, msg):
+        self.pr_enable = msg.data
+
+    def _cb_pr_home(self, msg):
+        self.pr_home = msg.data
 
     # ══════════════════════════════════════════════
     # Outgoing: ROS topics -> CAN frames
@@ -560,8 +580,10 @@ class CanBridgeNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CanBridgeNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:

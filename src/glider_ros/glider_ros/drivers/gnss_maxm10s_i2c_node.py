@@ -51,7 +51,7 @@ class UbxStreamParser:
         return self.buf.popleft()
 
     def _peek(self, i: int) -> int:
-        return list(self.buf)[i]
+        return self.buf[i]
 
     def messages(self):
         msgs = []
@@ -62,9 +62,6 @@ class UbxStreamParser:
             if self._peek(0) != UBX_SYNC_1 or self._peek(1) != UBX_SYNC_2:
                 self._pop()
                 continue
-
-            if len(self.buf) < 6:
-                break
 
             length = self._peek(4) | (self._peek(5) << 8)
             if length > self.max_payload:
