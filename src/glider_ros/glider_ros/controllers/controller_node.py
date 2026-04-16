@@ -68,7 +68,7 @@ class FirstOrderFilter:
 class GliderController(LifecycleNode):
 
     def __init__(self):
-        super().__init__('glider_controller')
+        super().__init__('controller_node')
 
         # Declare all parameters here so they can be set externally at any time
         self.declare_parameter('Kp_theta', 1.5)
@@ -93,7 +93,6 @@ class GliderController(LifecycleNode):
         self.declare_parameter('T_vbd_cmd', 5.0)
         self.declare_parameter('shift_cmd_tau', 0.01)
         self.declare_parameter('roll_cmd_tau', 5.0)
-        self.declare_parameter('max_dives', 1)
         self.declare_parameter('control_rate_hz', 10.0)
         self.declare_parameter('enable_roll', True)
 
@@ -107,7 +106,6 @@ class GliderController(LifecycleNode):
         # Control state — reset on activate
         self.operating = False
         self.diving = True
-        self.dive_count = 0
         self.alpha_ref_raw = 0.0
         self.shift_trim_raw = 0.0
         self.vbd_raw_pct = 0
@@ -187,7 +185,6 @@ class GliderController(LifecycleNode):
         self.dt = 1.0 / rate
 
         # Full state reset for a fresh dive
-        self.dive_count = 0
         self.diving = True
         self.pi_theta.reset()
         self.pi_q.reset()
@@ -202,11 +199,10 @@ class GliderController(LifecycleNode):
         self.vbd_raw_pct = 0
 
         self.operating = True
-        self.dive_count += 1
         self._ctrl_timer = self.create_timer(self.dt, self._control_loop)
 
         self.get_logger().info(
-            f'Controller activated — diving to {self.depth_lower}m (dive #{self.dive_count})')
+            f'Controller activated — diving to {self.depth_lower}m')
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state):
@@ -261,7 +257,6 @@ class GliderController(LifecycleNode):
         self.T_vbd_cmd = p('T_vbd_cmd').value
         self.shift_cmd_tau = p('shift_cmd_tau').value
         self.roll_cmd_tau = p('roll_cmd_tau').value
-        self.max_dives = p('max_dives').value
         self.enable_roll = p('enable_roll').value
 
     # ── Sensor callbacks ────────────────────────────────────────────────────
@@ -298,10 +293,9 @@ class GliderController(LifecycleNode):
             self.pi_p.reset()
             self.get_logger().info('Depth reached — switching to climb')
         elif not self.diving and self.depth <= self.depth_upper:
-            if self.dive_count >= self.max_dives:
-                self.operating = False
-                self.get_logger().info('Mission complete — at surface')
-                return False
+            self.operating = False
+            self.get_logger().info('Mission complete — at surface')
+            return False
 
         if self.diving:
             self.alpha_ref_raw = self.alpha_dive

@@ -146,13 +146,13 @@ class StateManagerNode(Node):
         self._iridium_lc_client = self.create_client(
             ChangeState, "/communication_iridium_node/change_state")
         self._ctrl_lc_client = self.create_client(
-            ChangeState, "/glider_controller/change_state")
+            ChangeState, "/controller_node/change_state")
 
         # -----------------------------
         # Parameter service client (controller)
         # -----------------------------
         self._param_client = self.create_client(
-            SetParameters, "/glider_controller/set_parameters")
+            SetParameters, "/controller_node/set_parameters")
 
         # -----------------------------
         # Main loop

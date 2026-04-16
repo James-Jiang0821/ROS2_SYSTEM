@@ -1,8 +1,16 @@
+import os
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import LifecycleNode, Node
 
 
 def generate_launch_description():
+    controller_params = os.path.join(
+        get_package_share_directory('glider_ros'),
+        'config', 'controller_params.yaml'
+    )
+
     return LaunchDescription([
         # --- Drivers ---
         # Node(
@@ -38,6 +46,12 @@ def generate_launch_description():
         ),
 
         # --- Managers ---
+        # Node(
+        #     package='glider_ros',
+        #     executable='can_bridge_node',
+        #     name='can_bridge_node',
+        #     output='screen'
+        # ),
         Node(
             package='glider_ros',
             executable='telemetry_manager_node',
@@ -72,10 +86,12 @@ def generate_launch_description():
         ),
 
         # --- Controllers ---
-        Node(
+        LifecycleNode(
             package='glider_ros',
             executable='controller_node',
             name='controller_node',
+            namespace='',
+            parameters=[controller_params],
             output='screen'
         ),
     ])

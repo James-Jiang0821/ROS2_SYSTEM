@@ -1,4 +1,4 @@
-glider_controller:
+controller_node:
   ros__parameters:
     # Control loop rate 
     control_rate_hz: 10.0
@@ -47,6 +47,3 @@ glider_controller:
     T_vbd_cmd: 5.0
     shift_cmd_tau: 0.01
     roll_cmd_tau: 5.0
-
-    # ── Mission 
-    max_dives: 1
