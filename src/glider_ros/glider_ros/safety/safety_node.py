@@ -5,7 +5,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float64, String
 
 
-WATCHDOG_STALENESS_THRESHOLD_S = 1200.0 # currently 20 mins
+WATCHDOG_STALENESS_THRESHOLD_S = 1200.0  # testing value = 20 min; production target TBD
 
 WATCHDOG_TOPICS = [
     "/glider/roll_rad",
@@ -81,7 +81,7 @@ class SafetyNode(Node):
         # 2 Hz republish timer — mirrors the Teensy fault-latch broadcast rate
         self.create_timer(0.5, self._republish_emergency)
 
-        # Staleness check timer — runs every 10 s (threshold is 120 s)
+        # Staleness check timer — runs every 10 s (threshold defaults to WATCHDOG_STALENESS_THRESHOLD_S)
         self.create_timer(10.0, self._check_staleness)
 
         self.get_logger().info(
@@ -145,6 +145,10 @@ class SafetyNode(Node):
         self._emergency_latched = True
         self._emergency_detail = detail
         self.get_logger().error(f"SAFETY: {detail} — triggering emergency")
+
+        emergency_msg = Bool()
+        emergency_msg.data = True
+        self._emergency_pub.publish(emergency_msg)
 
         detail_msg = String()
         detail_msg.data = detail
