@@ -7,12 +7,6 @@ def generate_launch_description():
         # --- Drivers ---
         Node(
             package='glider_ros',
-            executable='imu_bno085_node',
-            name='imu_bno085_node',
-            output='screen'
-        ),
-        Node(
-            package='glider_ros',
             executable='gnss_maxm10s_i2c_node',
             name='gnss_maxm10s_i2c_node',
             output='screen'
