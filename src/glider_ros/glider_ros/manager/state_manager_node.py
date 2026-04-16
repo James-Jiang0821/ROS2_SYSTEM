@@ -77,7 +77,7 @@ class StateManagerNode(Node):
         # -----------------------------
         # Parameters
         # -----------------------------
-        self.declare_parameter("idle_iridium_period_s", 300.0)    # 5 min
+        self.declare_parameter("idle_iridium_period_s", 100.0)    # 5 min change
         self.declare_parameter("emergency_iridium_period_s", 300.0)  # 5 min
         self.declare_parameter("iridium_settling_time_s", 60.0)
         self.declare_parameter("iridium_max_attempts", 3)
