@@ -15,8 +15,7 @@ On activate the node immediately begins diving. When depth_lower is
 reached it climbs back to depth_upper, then publishes COMPLETE on
 /controller/phase and stops. The state manager sees COMPLETE and
 deactivates the node.
-
-Gains from Ibrahim's glider_params.m:
+gains
   Outer PI: Kp=1.5, Ki=0.002 (Ti=750s)
   Inner PI: Kp=0.02, Ki=0.004 (Ti=5s)
   Roll outer PI: Kp_phi=0.3, Ki from Ti_phi=15s
@@ -96,6 +95,7 @@ class GliderController(LifecycleNode):
         self.declare_parameter('roll_cmd_tau', 5.0)
         self.declare_parameter('max_dives', 1)
         self.declare_parameter('control_rate_hz', 10.0)
+        self.declare_parameter('enable_roll', True)
 
         # Sensor state — updated by subscribers once configured
         self.theta = 0.0
@@ -262,6 +262,7 @@ class GliderController(LifecycleNode):
         self.shift_cmd_tau = p('shift_cmd_tau').value
         self.roll_cmd_tau = p('roll_cmd_tau').value
         self.max_dives = p('max_dives').value
+        self.enable_roll = p('enable_roll').value
 
     # ── Sensor callbacks ────────────────────────────────────────────────────
 
@@ -339,14 +340,17 @@ class GliderController(LifecycleNode):
         shift_smoothed = self.filt_shift_cmd.update(shift_total, self.dt)
         shift_m = max(self.shift_min_m, min(self.shift_max_m, shift_smoothed))
 
-        phi_err = 0.0 - self.phi
-        p_cmd = self.pi_phi.compute(phi_err, self.dt)
+        if self.enable_roll:
+            phi_err = 0.0 - self.phi
+            p_cmd = self.pi_phi.compute(phi_err, self.dt)
 
-        p_err = self.p - p_cmd
-        roll_pi_out = self.pi_p.compute(p_err, self.dt)
+            p_err = self.p - p_cmd
+            roll_pi_out = self.pi_p.compute(p_err, self.dt)
 
-        roll_smoothed = self.filt_roll_cmd.update(roll_pi_out, self.dt)
-        roll_rad = max(-self.roll_max_rad, min(self.roll_max_rad, roll_smoothed))
+            roll_smoothed = self.filt_roll_cmd.update(roll_pi_out, self.dt)
+            roll_rad = max(-self.roll_max_rad, min(self.roll_max_rad, roll_smoothed))
+        else:
+            roll_rad = 0.0
 
         shift_mm = shift_m * 1000.0
         roll_deg = math.degrees(roll_rad)

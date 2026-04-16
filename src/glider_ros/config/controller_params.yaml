@@ -1,0 +1,52 @@
+glider_controller:
+  ros__parameters:
+    # Control loop rate 
+    control_rate_hz: 10.0
+
+    # Feature toggles 
+    enable_roll: true
+
+    # Pitch (theta) outer loop
+    Kp_theta: 1.5
+    Ti_theta: 750.0
+
+    # Pitch rate (q) inner loop 
+    Kp_q: 0.02
+    Ti_q: 5.0
+
+    # Roll (phi) outer loop 
+    Kp_phi: 0.3
+    Ti_phi: 15.0
+
+    # Roll rate (p) inner loop 
+    Kp_p: 4.0
+    Ti_p: 20000.0
+
+    # Rate command limits (rad/s) 
+    q_cmd_max: 0.13962634   # ~8 deg/s
+    p_cmd_max: 0.08726646   # ~5 deg/s
+
+    # ── Mass-shift actuator limits (m) 
+    shift_max_m: 0.0569
+    shift_min_m: -0.0569
+
+    # Roll constraint (rad)
+    roll_max_rad: 1.5707963  # pi/2
+
+    # Depth targets (m) 
+    depth_upper: 1.0
+    depth_lower: 5.0
+
+    # Pitch angle commands (rad)
+    alpha_dive: 0.08726646   # ~5 deg nose-down
+    alpha_rise: -0.08726646  # ~5 deg nose-up
+
+    # First-order filter time constants (s)
+    T_alpha_cmd: 2.0
+    T_shift_trim: 5.0
+    T_vbd_cmd: 5.0
+    shift_cmd_tau: 0.01
+    roll_cmd_tau: 5.0
+
+    # ── Mission 
+    max_dives: 1

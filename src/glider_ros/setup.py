@@ -21,6 +21,10 @@ setup(
             os.path.join('share', package_name, 'launch'),
             glob('launch/*.py')
         ),
+        (
+            os.path.join('share', package_name, 'config'),
+            glob('config/*.yaml')
+        ),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -48,6 +52,7 @@ setup(
             'state_manager_node = glider_ros.manager.state_manager_node:main',
             'imu_manager_node = glider_ros.manager.imu_manager_node:main',
             'sonar_manager_node = glider_ros.manager.sonar_manager_node:main',
+            'glider_controller_node = glider_ros.controllers.controller_node:main',
             'controller_node = glider_ros.controllers.controller_node:main',
         ],
     },
