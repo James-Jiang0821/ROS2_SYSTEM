@@ -21,7 +21,6 @@ class Bno085ImuNode(Node):
         # Parameters
         self.declare_parameter("frame_id", "imu_link")
         self.declare_parameter("rate_hz", 10.0)
-        self.declare_parameter("i2c_frequency", 400000)
 
         self.declare_parameter("lin_acc_cov", 1e-2)
         self.declare_parameter("ang_vel_cov", 1e-2)
@@ -29,7 +28,6 @@ class Bno085ImuNode(Node):
 
         self.frame_id = self.get_parameter("frame_id").value
         self.rate_hz = float(self.get_parameter("rate_hz").value)
-        self.i2c_frequency = int(self.get_parameter("i2c_frequency").value)
 
         self.lin_acc_cov = float(self.get_parameter("lin_acc_cov").value)
         self.ang_vel_cov = float(self.get_parameter("ang_vel_cov").value)
@@ -51,7 +49,10 @@ class Bno085ImuNode(Node):
     def _init_sensor(self):
         self.get_logger().info("Initialising I2C and BNO085...")
 
-        i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
+        # BNO085 needs 400kHz I2C. On Raspberry Pi the bus clock is set by
+        # /boot/config.txt (add: dtparam=i2c_arm=on,i2c_arm_baudrate=400000);
+        # Blinka's busio.I2C frequency= arg is ignored on this platform.
+        i2c = busio.I2C(board.SCL, board.SDA)
         self.bno = BNO08X_I2C(i2c)
 
         self.get_logger().info("Resetting BNO085...")
