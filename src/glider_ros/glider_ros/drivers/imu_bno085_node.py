@@ -56,29 +56,17 @@ class Bno085ImuNode(Node):
 
         self.get_logger().info("Resetting BNO085...")
         self.bno.soft_reset()
-        time.sleep(3.0)
+        time.sleep(2.0)
 
         self.get_logger().info("Enabling rotation vector (9-DOF onboard fusion)...")
-        self._enable_feature_with_retry(BNO_REPORT_ROTATION_VECTOR, "rotation vector")
+        self.bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
         time.sleep(0.1)
 
         self.get_logger().info("Enabling gyroscope...")
-        self._enable_feature_with_retry(BNO_REPORT_GYROSCOPE, "gyroscope")
+        self.bno.enable_feature(BNO_REPORT_GYROSCOPE)
         time.sleep(0.1)
 
         self.get_logger().info("BNO085 ready.")
-
-    def _enable_feature_with_retry(self, feature, name, retries=5, delay=0.5):
-        for attempt in range(retries):
-            try:
-                self.bno.enable_feature(feature)
-                return
-            except RuntimeError:
-                if attempt < retries - 1:
-                    self.get_logger().warn(f"Retrying enable {name} ({attempt + 1}/{retries})...")
-                    time.sleep(delay)
-                else:
-                    raise
 
     def _tick(self):
         try:
